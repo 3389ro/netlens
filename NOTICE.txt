@@ -1,0 +1,64 @@
+NetLens — Third-party notices and acknowledgements
+
+NetLens is released under the MIT License. See LICENSE.txt for full terms.
+
+This file lists the third-party data sources, system libraries and operating-
+system APIs that NetLens depends on at runtime, with their respective licences
+and attribution requirements.
+
+============================================================================
+1. IEEE Registration Authority — public OUI registries
+============================================================================
+
+NetLens embeds the IEEE Registration Authority's public CSV registries for
+MA-L /24, MA-M /28 and MA-S /36 OUI assignments (organisation names indexed
+by MAC OUI). These registries are published by IEEE for free public use; no
+copyright is claimed and no attribution is required.
+
+Source URL:  https://standards-oui.ieee.org/
+Files used:  oui.csv (MA-L), mam.csv (MA-M), oui36.csv (MA-S)
+Status:      Public data, no licence terms imposed by IEEE.
+
+The vendor names visible in NetLens scan results are derived from this
+registry by looking up the OUI portion of each scanned host's MAC address.
+They represent the manufacturer-of-record reported by IEEE for that address
+block. Trademarks and brand names so produced are the property of their
+respective owners; their appearance in NetLens output does not imply any
+commercial relationship, sponsorship or endorsement.
+
+============================================================================
+2. Microsoft Windows API
+============================================================================
+
+NetLens is a native Win32 application that links statically against the
+Microsoft Visual C++ runtime and the public Windows SDK. The following
+Windows APIs are called at runtime: Winsock 2, IP Helper (iphlpapi),
+ICMP Echo, DnsResolveName, Common Controls 6, GDI / GDI+ and the standard
+process / thread / file APIs.
+
+These are part of the Microsoft Windows operating system. NetLens does not
+redistribute Microsoft binaries or headers.
+
+============================================================================
+3. C++20 Standard Library
+============================================================================
+
+NetLens depends on the C++20 standard library as provided by the MSVC
+toolchain. Standard-library headers and binaries are not redistributed.
+
+============================================================================
+4. Build system
+============================================================================
+
+The build script invokes CMake (https://cmake.org/) and the Microsoft Visual
+Studio 2022 build tools. These are not redistributed with NetLens; they are
+only required to build from source.
+
+============================================================================
+
+3389 Software Outsourcing SRL maintains NetLens. The application is not
+affiliated with, sponsored by, or endorsed by any of the organisations or
+vendors referenced above or whose products appear in scan results.
+
+If you believe content in or alongside NetLens misrepresents your brand,
+please contact 3389 Software Outsourcing at office@3389.com.

@@ -1,0 +1,220 @@
+#include <windows.h>
+#include "resource.h"
+
+/////////////////////////////////////////////////////////////////////////////
+// Version information
+/////////////////////////////////////////////////////////////////////////////
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,2,0,0
+ PRODUCTVERSION 1,2,0,0
+ FILEFLAGSMASK  0x3fL
+#ifdef _DEBUG
+ FILEFLAGS      0x1L
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         0x40004L
+ FILETYPE       0x1L
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "3389.ro"
+            VALUE "FileDescription",  "NetLens"
+            VALUE "FileVersion",      "1.2.0.0"
+            VALUE "InternalName",     "NetLens"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 3389.ro"
+            VALUE "OriginalFilename", "NetLens.exe"
+            VALUE "ProductName",      "NetLens"
+            VALUE "ProductVersion",   "1.2.0.0"
+            VALUE "Comments",         "Portable LAN scanner. No telemetry, no cloud, no installer."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Main menu
+/////////////////////////////////////////////////////////////////////////////
+
+IDR_MAIN_MENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "Export &HTML...",      IDM_FILE_EXPORT_HTML
+        MENUITEM "Export &CSV...",       IDM_FILE_EXPORT_CSV
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit",                IDM_FILE_EXIT
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "&Hide offline hosts",     IDM_VIEW_HIDE_OFFLINE, CHECKED
+    END
+    POPUP "&Tools"
+    BEGIN
+        MENUITEM "Select &adapter...",    IDM_TOOLS_ADAPTERS
+        MENUITEM "&Settings...",          IDM_TOOLS_SETTINGS
+        MENUITEM "Manage port &presets...", IDM_TOOLS_PRESETS
+        MENUITEM SEPARATOR
+        MENUITEM "&Refresh adapters",     IDM_TOOLS_REFRESH
+        MENUITEM "&Clear results",        IDM_TOOLS_CLEAR
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&About NetLens", IDM_HELP_ABOUT
+    END
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Settings dialog (Tools → Settings)
+/////////////////////////////////////////////////////////////////////////////
+
+IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 280, 200
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Scan settings"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Timeout (ms)",          -1,            12, 14, 90, 10
+    EDITTEXT                                 IDC_SET_TIMEOUT,108, 12, 60, 14, ES_AUTOHSCROLL | ES_NUMBER
+
+    LTEXT           "Parallel probes",       -1,            12, 36, 90, 10
+    EDITTEXT                                 IDC_SET_PARALLEL,108, 34, 60, 14, ES_AUTOHSCROLL | ES_NUMBER
+
+    LTEXT           "Scan mode",             -1,            12, 58, 90, 10
+    COMBOBOX                                 IDC_SET_MODE,  108, 56, 158, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    GROUPBOX        "Discovery",             -1,            12, 82, 254, 78
+    CONTROL         "Resolve DNS hostnames",       IDC_SET_DNS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 24,  98, 234, 12
+    CONTROL         "Resolve MAC vendors",         IDC_SET_MAC, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 116, 234, 12
+    CONTROL         "Resolve UDP services (NetBIOS / mDNS / SSDP / SNMP / DNS / NTP)", IDC_SET_UDP,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 24, 134, 234, 20
+
+    DEFPUSHBUTTON   "OK",                    IDOK,          158, 178, 50, 16
+    PUSHBUTTON      "Cancel",                IDCANCEL,      216, 178, 50, 16
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Adapter selection dialog (Tools → Select adapter / top-row icon button)
+/////////////////////////////////////////////////////////////////////////////
+
+IDD_ADAPTER_DIALOG DIALOGEX 0, 0, 340, 200
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Select network adapter"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LISTBOX         IDC_ADA_LIST,            12, 12, 316, 120, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "",                      IDC_ADA_INFO,  12, 138, 316, 24
+    PUSHBUTTON      "&Refresh",              IDC_ADA_REFRESH,12,170, 60, 16
+    DEFPUSHBUTTON   "Use selected",          IDOK,          218,170, 60, 16
+    PUSHBUTTON      "Cancel",                IDCANCEL,      282,170, 50, 16
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Host-details dialog (double-click a result row)
+/////////////////////////////////////////////////////////////////////////////
+
+IDD_HOST_DETAILS DIALOGEX 0, 0, 500, 400
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Host details"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "IP address",            -1,             12, 12, 80, 10
+    LTEXT           "",                      IDC_HD_IP,      96, 12, 368, 10
+    CONTROL         "",  IDC_HD_COPY_BTN_IP,       "Button", BS_OWNERDRAW | WS_TABSTOP, 470, 10, 18, 14
+
+    LTEXT           "Status",                -1,             12, 26, 80, 10
+    LTEXT           "",                      IDC_HD_STATUS,  96, 26, 368, 10
+    CONTROL         "",  IDC_HD_COPY_BTN_STATUS,   "Button", BS_OWNERDRAW | WS_TABSTOP, 470, 24, 18, 14
+
+    LTEXT           "Hostname",              -1,             12, 40, 80, 10
+    LTEXT           "",                      IDC_HD_HOSTNAME,96, 40, 368, 10
+    CONTROL         "",  IDC_HD_COPY_BTN_HOSTNAME, "Button", BS_OWNERDRAW | WS_TABSTOP, 470, 38, 18, 14
+
+    LTEXT           "Vendor",                -1,             12, 54, 80, 10
+    LTEXT           "",                      IDC_HD_VENDOR,  96, 54, 368, 10
+    CONTROL         "",  IDC_HD_COPY_BTN_VENDOR,   "Button", BS_OWNERDRAW | WS_TABSTOP, 470, 52, 18, 14
+
+    LTEXT           "MAC address",           -1,             12, 68, 80, 10
+    LTEXT           "",                      IDC_HD_MAC,     96, 68, 368, 10
+    CONTROL         "",  IDC_HD_COPY_BTN_MAC,      "Button", BS_OWNERDRAW | WS_TABSTOP, 470, 66, 18, 14
+
+    LTEXT           "Discovery",             -1,             12, 82, 80, 10
+    LTEXT           "",                      IDC_HD_DISCOVERY,96,82, 368, 10
+    CONTROL         "",  IDC_HD_COPY_BTN_DISC,     "Button", BS_OWNERDRAW | WS_TABSTOP, 470, 80, 18, 14
+
+    LTEXT           "Risk",                  -1,             12, 96, 80, 10
+    LTEXT           "",                      IDC_HD_RISK,    96, 96, 368, 10
+    CONTROL         "",  IDC_HD_COPY_BTN_RISK,     "Button", BS_OWNERDRAW | WS_TABSTOP, 470, 94, 18, 14
+
+    LTEXT           "Risk hints",            -1,             12,110, 80, 10
+    LTEXT           "",                      IDC_HD_RISK_HINTS,96,110, 368, 28
+    CONTROL         "",  IDC_HD_COPY_BTN_HINTS,    "Button", BS_OWNERDRAW | WS_TABSTOP, 470,108, 18, 14
+
+    GROUPBOX        "Open ports  (click header to sort • select a port to target it with the actions below)", -1,  12,144,476,196
+    CONTROL         "",                      IDC_HD_PORTS_LIST,"SysListView32",
+                    LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | WS_TABSTOP | WS_BORDER,
+                    20,158,460,176
+
+    PUSHBUTTON      "Ping",                  IDC_HD_PING,        12,352, 50, 16
+    PUSHBUTTON      "Browser",               IDC_HD_OPEN_BROWSER,66,352, 56, 16
+    PUSHBUTTON      "RDP",                   IDC_HD_OPEN_RDP,    126,352, 50, 16
+    PUSHBUTTON      "SSH",                   IDC_HD_OPEN_SSH,    180,352, 50, 16
+    PUSHBUTTON      "Telnet",                IDC_HD_OPEN_TELNET, 234,352, 50, 16
+    PUSHBUTTON      "VNC",                   IDC_HD_OPEN_VNC,    288,352, 50, 16
+    DEFPUSHBUTTON   "Close",                 IDOK,               438,352, 50, 16
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Preset manager dialog (Tools -> Manage port presets)
+/////////////////////////////////////////////////////////////////////////////
+
+IDD_PRESET_MANAGER DIALOGEX 0, 0, 480, 260
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Manage port presets"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Presets:",                      -1,             12,  8, 100, 10
+    LISTBOX                                          IDC_PM_LIST,    12, 22, 180, 200,
+                    LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+
+    PUSHBUTTON      "&New",                          IDC_PM_NEW,     12, 230, 56, 16
+    PUSHBUTTON      "&Delete",                       IDC_PM_DELETE,  72, 230, 56, 16
+    PUSHBUTTON      "Reset defaults",                IDC_PM_RESET,  132, 230, 70, 16
+
+    LTEXT           "Display name:",                 -1,            206,  8,  90, 10
+    EDITTEXT                                         IDC_PM_NAME,   206, 22, 262, 14, ES_AUTOHSCROLL
+
+    LTEXT           "Ports (CSV, ranges allowed e.g. 80,443,8000-8010):", -1,
+                                                                    206, 42, 262, 10
+    EDITTEXT                                         IDC_PM_PORTS,  206, 54, 262, 138,
+                    ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Vendor-detected hosts auto-prepend their vendor priority ports first.",
+                                                     IDC_PM_HINT,   206, 196, 262, 14
+
+    PUSHBUTTON      "&Apply to preset",              IDC_PM_APPLY,  206, 210, 80, 14
+
+    DEFPUSHBUTTON   "OK",                            IDOK,          362, 230, 50, 16
+    PUSHBUTTON      "Cancel",                        IDCANCEL,      418, 230, 50, 16
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Application manifest (visual styles, DPI awareness, asInvoker)
+/////////////////////////////////////////////////////////////////////////////
+
+// CREATEPROCESS_MANIFEST_RESOURCE_ID (1) makes the linker embed this manifest
+// as the side-by-side manifest for the executable.
+1 RT_MANIFEST "NetLens.manifest"
+
+/////////////////////////////////////////////////////////////////////////////
+// Application icon (multi-resolution: 16/24/32/48/64/128/256). Authored by
+// src/resources/make-icon.ps1 — re-run that script to regenerate.
+/////////////////////////////////////////////////////////////////////////////
+
+IDI_APP_ICON ICON "NetLens.ico"

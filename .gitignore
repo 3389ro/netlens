@@ -1,0 +1,54 @@
+# Build output
+build/
+out/
+x64/
+Release/
+Debug/
+
+# MSVC / Visual Studio
+.vs/
+*.user
+*.suo
+*.sln.docstates
+*.vcxproj.user
+*.vcxproj.filters.user
+*.opensdf
+*.sdf
+*.opendb
+*.aps
+ipch/
+*.pdb
+*.idb
+*.tlog
+*.ilk
+*.exp
+*.lib
+*.pch
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+*.cmake
+!CMakeLists.txt
+!cmake/*.cmake
+
+# Local tooling
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local agent / editor configs we don't want public
+CLAUDE.md
+.cursorrules
+.aider*
+
+# Binaries published as GitHub Release assets, not committed
+*.exe
+*.dll
+
+# Source ZIPs that we publish via Releases or the website
+NetLens-*-source.zip
