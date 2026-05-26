@@ -1,156 +1,122 @@
 cmake_minimum_required(VERSION 3.20)
 
 # -----------------------------------------------------------------------------
-# NetLens - Portable LAN Scanner for Small Business Networks
-# Native C++20 / Win32 GUI + CLI. No external dependencies.
+# NetLens — pure Win32 + C++20. Single self-contained executable.
+# No external UI libraries. Engine lives in engine/ and links statically.
 # -----------------------------------------------------------------------------
 
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" NETLENS_VERSION LIMIT_COUNT 1)
+string(STRIP "${NETLENS_VERSION}" NETLENS_VERSION)
+if (NOT NETLENS_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "VERSION must be MAJOR.MINOR.PATCH, got: ${NETLENS_VERSION}")
+endif()
+string(REPLACE "." ";" NETLENS_VERSION_PARTS "${NETLENS_VERSION}")
+list(GET NETLENS_VERSION_PARTS 0 NETLENS_VERSION_MAJOR)
+list(GET NETLENS_VERSION_PARTS 1 NETLENS_VERSION_MINOR)
+list(GET NETLENS_VERSION_PARTS 2 NETLENS_VERSION_PATCH)
+message(STATUS "NetLens version: ${NETLENS_VERSION}")
+
 project(NetLens
-    VERSION 1.2.0
-    DESCRIPTION "Portable LAN scanner for small business networks"
-    LANGUAGES CXX RC)
+    VERSION     "${NETLENS_VERSION}"
+    DESCRIPTION "NetLens — portable LAN scanner"
+    LANGUAGES   CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Ship a single self-contained .exe — no MSVC runtime DLLs needed on target machines.
+# Static CRT — no vcruntime/msvcp DLL deps
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 if (MSVC)
-    add_compile_options(/W4 /permissive- /utf-8 /Zc:__cplusplus /EHsc)
+    add_compile_options(
+        /W4 /permissive- /utf-8 /Zc:__cplusplus /EHsc
+        /GR-                          # no RTTI
+        /Zc:inline
+        /Gy /Gw
+    )
+    add_compile_options(
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/Os>
+        $<$<CONFIG:Release>:/Oy>
+        $<$<CONFIG:Release>:/Oi>
+        $<$<CONFIG:Release>:/Ob3>
+        $<$<CONFIG:Release>:/GL>
+    )
     add_compile_definitions(
         UNICODE _UNICODE
-        WIN32_LEAN_AND_MEAN
-        NOMINMAX
-        _WIN32_WINNT=0x0A00            # Windows 10
+        WIN32_LEAN_AND_MEAN NOMINMAX
+        _WIN32_WINNT=0x0A00
         _CRT_SECURE_NO_WARNINGS
-        _WINSOCK_DEPRECATED_NO_WARNINGS)
-    # Release defaults: optimised, no debug symbols in the binary
-    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG /Oy /GL")
-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/LTCG /OPT:REF /OPT:ICF")
+        $<$<CONFIG:Release>:_HAS_ITERATOR_DEBUGGING=0>
+        $<$<CONFIG:Release>:_ITERATOR_DEBUG_LEVEL=0>
+    )
+    add_link_options(
+        $<$<CONFIG:Release>:/LTCG>
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+        $<$<CONFIG:Release>:/INCREMENTAL:NO>
+        /SUBSYSTEM:WINDOWS
+        /MANIFEST:NO       # we embed app.manifest via app.rc — don't auto-generate
+    )
 endif()
 
-# -----------------------------------------------------------------------------
-# Source files
-# -----------------------------------------------------------------------------
+# Engine: builds as a STATIC library and PUBLIC-links the Win32 libs it
+# needs — those propagate to NetLens automatically via
+# target_link_libraries.
+add_subdirectory(engine)
 
-set(CORE_SOURCES
-    src/core/NetworkAdapterService.cpp
-    src/core/IpAddressUtils.cpp
-    src/core/IpRangeParser.cpp
-    src/core/ScanPresetService.cpp
-    src/core/NetworkScanner.cpp
-    src/core/PingService.cpp
-    src/core/PortScanner.cpp
-    src/core/DnsResolver.cpp
-    src/core/MacResolver.cpp
-    src/core/VendorResolver.cpp
-    src/core/VendorPortProfiles.cpp
-    src/core/UdpProbes.cpp
-    src/core/OuiData.cpp
-    src/core/ServiceDetector.cpp
-    src/core/RiskAnalyzer.cpp
-    src/core/BaselineStore.cpp
-    src/core/ReportExporter.cpp
-    src/core/HostMonitor.cpp
-    src/core/ThreadPool.cpp
-    src/core/Stopwatch.cpp)
-
-set(CORE_HEADERS
-    src/AppConstants.h
-    src/Models.h
-    src/core/NetworkAdapterService.h
-    src/core/IpAddressUtils.h
-    src/core/IpRangeParser.h
-    src/core/ScanPresetService.h
-    src/core/NetworkScanner.h
-    src/core/PingService.h
-    src/core/PortScanner.h
-    src/core/DnsResolver.h
-    src/core/MacResolver.h
-    src/core/VendorResolver.h
-    src/core/VendorPortProfiles.h
-    src/core/UdpProbes.h
-    src/core/OuiData.h
-    src/core/ServiceDetector.h
-    src/core/RiskAnalyzer.h
-    src/core/BaselineStore.h
-    src/core/ReportExporter.h
-    src/core/HostMonitor.h
-    src/core/ThreadPool.h
-    src/core/Stopwatch.h)
-
-set(CLI_SOURCES
-    src/cli/CliApp.cpp
-    src/cli/CommandLineParser.cpp)
-set(CLI_HEADERS
-    src/cli/CliApp.h
-    src/cli/CommandLineParser.h)
-
-set(GUI_SOURCES
-    src/gui/GuiApp.cpp
-    src/gui/MainWindow.cpp
-    src/gui/MonitorWindow.cpp
-    src/gui/GuiControls.cpp
-    src/gui/GuiLayout.cpp
-    src/gui/GuiUtils.cpp)
-set(GUI_HEADERS
-    src/gui/GuiApp.h
-    src/gui/MainWindow.h
-    src/gui/MonitorWindow.h
-    src/gui/GuiControls.h
-    src/gui/GuiLayout.h
-    src/gui/GuiUtils.h)
-
-set(RESOURCE_FILES
-    src/resources/resource.h
-    src/resources/app.rc
-    src/resources/NetLens.manifest)
-
-add_executable(NetLens WIN32
+set(NETLENS_SOURCES
     src/main.cpp
-    ${CORE_SOURCES}  ${CORE_HEADERS}
-    ${CLI_SOURCES}   ${CLI_HEADERS}
-    ${GUI_SOURCES}   ${GUI_HEADERS}
-    ${RESOURCE_FILES})
+    src/App.cpp
+    src/MainWindow.cpp
+    src/Capture.cpp
+    src/Theme.cpp
+    src/Dpi.cpp
+    src/Controls/StatCard.cpp
+    src/Controls/HostTable.cpp
+    src/Controls/DetailsPanel.cpp
+    src/Dialogs/AboutDialog.cpp
+    src/Dialogs/AdaptersDialog.cpp
+    src/Dialogs/SettingsDialog.cpp
+    src/Dialogs/PortListsDialog.cpp
+    # headers — listed so IDEs pick them up
+    src/App.h
+    src/MainWindow.h
+    src/Capture.h
+    src/Theme.h
+    src/Models.h
+    src/Dpi.h
+    src/Controls/StatCard.h
+    src/Controls/HostTable.h
+    src/Controls/DetailsPanel.h
+    src/Dialogs/AboutDialog.h
+    src/Dialogs/AdaptersDialog.h
+    src/Dialogs/SettingsDialog.h
+    src/Dialogs/PortListsDialog.h
+    Resource.h
+    app.rc
+)
 
-target_include_directories(NetLens PRIVATE src)
+add_executable(NetLens WIN32 ${NETLENS_SOURCES})
 
-# Required Windows libraries — nothing external.
+target_include_directories(NetLens PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+target_compile_definitions(NetLens PRIVATE
+    NETLENS_VERSION_STR="${NETLENS_VERSION}"
+    NETLENS_VERSION_MAJOR=${NETLENS_VERSION_MAJOR}
+    NETLENS_VERSION_MINOR=${NETLENS_VERSION_MINOR}
+    NETLENS_VERSION_PATCH=${NETLENS_VERSION_PATCH})
+
+# RC files inherit target_compile_definitions and target_include_directories
+# (CMake >= 3.20).
 target_link_libraries(NetLens PRIVATE
-    ws2_32
-    iphlpapi
-    comctl32
-    shlwapi
-    user32
-    gdi32
-    comdlg32
-    advapi32
-    shell32
-    ole32
-    winhttp)
+    netlens_engine
+    user32 gdi32 comctl32 comdlg32 shell32 advapi32 ole32 msimg32 uxtheme
+    gdiplus)   # PNG save for Ctrl+T captures
 
-# GUI subsystem — the OS never allocates a console for this process, so the
-# GUI launch is truly flash-free (no black rect on the left while wmain
-# wakes up). For CLI invocations we AttachConsole(ATTACH_PARENT_PROCESS) in
-# main.cpp to plug stdout/stderr into the calling cmd.exe / Windows Terminal,
-# falling back to AllocConsole when there isn't a parent terminal.
 set_target_properties(NetLens PROPERTIES
-    OUTPUT_NAME "NetLens"
-    WIN32_EXECUTABLE TRUE
-    VS_DPI_AWARE "PerMonitor")
-
-# Our app.rc embeds the manifest explicitly (so we keep ComCtl6 visual styles,
-# DPI awareness and asInvoker in one place). Tell MSBuild not to auto-generate
-# a second manifest, otherwise the resource compiler errors with CVT1100.
-if (MSVC)
-    target_link_options(NetLens PRIVATE /MANIFEST:NO)
-endif()
-
-# Friendly source groups in Visual Studio.
-source_group("src" FILES src/main.cpp src/AppConstants.h src/Models.h)
-source_group("src\\core" FILES ${CORE_SOURCES} ${CORE_HEADERS})
-source_group("src\\cli" FILES ${CLI_SOURCES} ${CLI_HEADERS})
-source_group("src\\gui" FILES ${GUI_SOURCES} ${GUI_HEADERS})
-source_group("src\\resources" FILES ${RESOURCE_FILES})
+    OUTPUT_NAME              "NetLens"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

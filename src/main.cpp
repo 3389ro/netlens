@@ -1,133 +1,134 @@
-// =============================================================================
-// NetLens - entry point  (v1.0.2 — GUI subsystem)
+// main.cpp — Win32 entry point for NetLens.win32.
 //
-// We build as the **Windows GUI subsystem** so the OS never allocates a
-// console for this process. GUI launches are truly flash-free.
-//
-// CLI mode: we AttachConsole(ATTACH_PARENT_PROCESS) when --help / --range /
-// other CLI args are present. That plugs stdout/stderr into the calling
-// terminal (cmd, PowerShell, Windows Terminal). When there is no parent
-// console (Explorer launch of a CLI-args shortcut, or a tool that captures
-// stdout differently), AllocConsole opens a fresh window. Either way the
-// user gets CLI output.
-//
-// Note on PowerShell redirection: PowerShell does NOT wait for GUI-subsystem
-// processes to exit, so `NetLens.exe --help | head` won't pipe cleanly
-// from PowerShell. For piping use `cmd /c NetLens.exe --help | head`,
-// or run the .exe from cmd.exe directly. Interactive CLI output (no pipe)
-// works from any shell because the AttachConsole path writes to the
-// terminal directly.
-// =============================================================================
+// Sets process DPI awareness, initializes COM + common controls, builds the
+// global App singleton, registers custom window classes, and pumps the
+// message loop until the main window is destroyed.
 
 #include <windows.h>
-#include <winsock2.h>
-#include <shellapi.h>
+#include <commctrl.h>
+#include <objbase.h>
+// GDI+ needs std::min/max + PROPID before its headers. NOMINMAX is defined
+// globally so we have to bring the std versions into the gdiplus namespace
+// search scope, and <objidl.h> declares PROPID for GdiplusImaging.h.
+#include <algorithm>
+using std::min;
+using std::max;
+#include <objidl.h>
+#include <gdiplus.h>
 
-#include <fcntl.h>
-#include <io.h>
-#include <stdio.h>
+#include "../Resource.h"
+#include "App.h"
+#include "Dpi.h"
+#include "Theme.h"
+#include "MainWindow.h"
+#include "Controls/DetailsPanel.h"
+#include "Controls/StatCard.h"
 
-#include <string>
-#include <vector>
-
-#include "AppConstants.h"
-#include "cli/CliApp.h"
-#include "cli/CommandLineParser.h"
-#include "gui/GuiApp.h"
-
-namespace {
-
-// Wires stdout / stderr / stdin to whichever console handle is available —
-// the parent process's console if there is one, otherwise a freshly
-// allocated console of our own. Idempotent; returns true on success.
-bool attachOrCreateConsole() {
-    bool attached = ::AttachConsole(ATTACH_PARENT_PROCESS) != FALSE;
-    if (!attached) {
-        // No parent console (e.g. launched from Explorer with saved args).
-        // Allocate a private one so CLI output still has a destination.
-        attached = ::AllocConsole() != FALSE;
-    }
-    if (!attached) return false;
-
-    // Re-bind the CRT stdio streams to the new console handles. Without this
-    // step printf / fputws / std::wcout still target the (closed) GUI stdio
-    // and the user sees nothing.
-    FILE* fp = nullptr;
-    freopen_s(&fp, "CONOUT$", "w", stdout);
-    freopen_s(&fp, "CONOUT$", "w", stderr);
-    freopen_s(&fp, "CONIN$",  "r", stdin);
-
-    // UTF-16 output so std::fputws emits proper wide-char text.
-    _setmode(_fileno(stdout), _O_U8TEXT);
-    _setmode(_fileno(stderr), _O_U8TEXT);
-
-    // Print a newline so the parent shell's prompt doesn't sit on the same
-    // line as our first line of output (cosmetic).
-    return true;
-}
-
-// Send a synthetic Enter to the attached console once we're done, so the
-// parent shell's prompt redraws cleanly on its own line. Strictly cosmetic.
-void nudgeParentPrompt() {
-    INPUT_RECORD ir[2]{};
-    ir[0].EventType = KEY_EVENT;
-    ir[0].Event.KeyEvent.bKeyDown = TRUE;
-    ir[0].Event.KeyEvent.wRepeatCount = 1;
-    ir[0].Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
-    ir[0].Event.KeyEvent.uChar.UnicodeChar = L'\r';
-    ir[1] = ir[0];
-    ir[1].Event.KeyEvent.bKeyDown = FALSE;
-
-    HANDLE hIn = ::GetStdHandle(STD_INPUT_HANDLE);
-    if (hIn && hIn != INVALID_HANDLE_VALUE) {
-        DWORD written = 0;
-        ::WriteConsoleInputW(hIn, ir, 2, &written);
-    }
-}
-
-} // anonymous namespace
-
-int APIENTRY wWinMain(HINSTANCE hInstance,
-                      HINSTANCE /*hPrevInstance*/,
-                      LPWSTR    /*lpCmdLine*/,
-                      int       /*nCmdShow*/)
-{
-    // Winsock 2.2 — required by every network service we use.
-    WSADATA wsa{};
-    if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        ::MessageBoxW(nullptr,
-                      L"Winsock initialisation failed.",
-                      L"NetLens",
-                      MB_OK | MB_ICONERROR);
-        return -1;
-    }
-
-    // Parse the command line. wWinMain doesn't see argc/argv directly, so we
-    // pull them from GetCommandLineW via the shell helper.
-    int argc = 0;
-    LPWSTR* argv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
-    if (!argv) {
-        ::WSACleanup();
-        return -1;
-    }
-
-    int rc = 0;
-    auto parsed = netlens::CommandLineParser::parse(argc, argv);
-
-    if (parsed.wantsCli() || parsed.hasError) {
-        // CLI mode: take over the parent terminal.
-        if (attachOrCreateConsole()) {
-            std::fputws(L"\n", stdout);  // newline before our first output
+int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE /*hPrev*/, LPWSTR /*cmd*/, int nCmdShow) {
+    // DPI awareness — legacy-Windows safe.
+    //
+    // `SetProcessDpiAwarenessContext` (Win 10 1703+) and `SetProcessDpiAwareness`
+    // (shcore.dll, Win 8.1+) are newer APIs. On Windows Server 2012 / Win 7
+    // they don't exist; statically linking against them makes the EXE
+    // unloadable. Resolve each via GetProcAddress, walking the tiers from
+    // newest to oldest, and fall back to the always-present
+    // `SetProcessDPIAware` (user32, Vista+) if nothing else worked.
+    //
+    // app.manifest already declares PerMonitorV2; the runtime calls below
+    // are a safety net for builds with a stripped manifest.
+    using PFN_Set_v2     = BOOL (WINAPI*)(DPI_AWARENESS_CONTEXT);
+    using PFN_Set_v1     = HRESULT (WINAPI*)(int /*PROCESS_DPI_AWARENESS*/);
+    using PFN_Set_legacy = BOOL (WINAPI*)(void);
+    bool dpiSet = false;
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        auto fn = reinterpret_cast<PFN_Set_v2>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+        if (fn) {
+            fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            dpiSet = true;
         }
-        rc = netlens::CliApp::run(argc, argv);
-        nudgeParentPrompt();
-        ::FreeConsole();
-    } else {
-        // GUI mode: zero console flash because we never had one to begin with.
-        rc = netlens::gui::GuiApp::run(hInstance, SW_SHOW);
+    }
+    if (!dpiSet) {
+        if (HMODULE shcore = LoadLibraryW(L"shcore.dll")) {
+            auto fn = reinterpret_cast<PFN_Set_v1>(
+                GetProcAddress(shcore, "SetProcessDpiAwareness"));
+            if (fn) { fn(2 /* PROCESS_PER_MONITOR_DPI_AWARE */); dpiSet = true; }
+            // intentionally leak the handle — process-lifetime
+        }
+    }
+    if (!dpiSet) {
+        if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+            auto fn = reinterpret_cast<PFN_Set_legacy>(
+                GetProcAddress(user32, "SetProcessDPIAware"));
+            if (fn) fn();
+        }
     }
 
-    ::LocalFree(argv);
-    ::WSACleanup();
-    return rc;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    // GDI+ initialised for PNG capture (Ctrl+T).
+    Gdiplus::GdiplusStartupInput gdiInput;
+    ULONG_PTR gdiplusToken = 0;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiInput, nullptr);
+
+    INITCOMMONCONTROLSEX icex{};
+    icex.dwSize = sizeof(icex);
+    icex.dwICC  = ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS
+                | ICC_BAR_CLASSES      | ICC_STANDARD_CLASSES
+                | ICC_TAB_CLASSES;
+    InitCommonControlsEx(&icex);
+
+    // Bootstrap palette + fonts at the system DPI; MainWindow refines
+    // once it has its real HWND in WM_CREATE. The compat wrapper is
+    // required so the binary loads on Windows Server 2012 / Win 7/8/8.1
+    // (the raw GetDpiForSystem is a Win10 1607+ user32 export).
+    nl::dpi::Update(nl::dpi::GetDpiForSystemCompat());
+    nl::theme::Init(nl::dpi::g_dpi);
+
+    nl::App::Instance().Init(hInst);
+
+    nl::StatCard::Register(hInst);
+    nl::DetailsPanel::Register(hInst);
+    nl::MainWindow::Register(hInst);
+
+    HWND hMain = nl::MainWindow::Create(hInst, nCmdShow);
+    if (!hMain) {
+        nl::theme::Shutdown();
+        CoUninitialize();
+        return 1;
+    }
+
+    HACCEL hAccel = LoadAcceleratorsW(hInst, MAKEINTRESOURCEW(IDR_ACCEL));
+
+    MSG msg;
+    int ret;
+    while ((ret = GetMessageW(&msg, nullptr, 0, 0)) != 0) {
+        if (ret == -1) break;
+
+        // Global Ctrl+T — route to the main window regardless of which of our
+        // top-level windows has focus right now (the modal About / Settings /
+        // Adapters / PortLists dialogs don't propagate accelerator translation
+        // up to hMain otherwise, so Ctrl+T silently dropped while a dialog was
+        // up). DoCapture itself enumerates every visible top-level window in
+        // this process, so one press still grabs the dialog + main pair.
+        if (msg.message == WM_KEYDOWN
+            && msg.wParam == 'T'
+            && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            PostMessageW(hMain, WM_COMMAND, IDM_TOOLS_CAPTURE, 0);
+            continue;
+        }
+
+        if (!hAccel || !TranslateAcceleratorW(hMain, hAccel, &msg)) {
+            if (!IsDialogMessageW(hMain, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    nl::App::Instance().Shutdown();
+    nl::theme::Shutdown();
+    Gdiplus::GdiplusShutdown(gdiplusToken);
+    CoUninitialize();
+    return static_cast<int>(msg.wParam);
 }
