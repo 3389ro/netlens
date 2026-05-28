@@ -25,6 +25,12 @@ namespace nl {
 
 namespace {
 
+// Single source of truth for the details-pane minimum width (px @96 dpi).
+// Used by BOTH the layout clamp in Compute() and the splitter-drag clamp, so
+// they can't disagree (they previously used 280 and 390 respectively, which
+// let a window-resize after a drag snap the panel to a different width).
+constexpr int kDetailsMinDip = 360;
+
 // ---------------------------------------------------------------------------
 // Per-instance state — heap-allocated, pointer stashed in GWLP_USERDATA.
 // ---------------------------------------------------------------------------
@@ -48,6 +54,7 @@ struct State {
     HWND  filterCombo     = nullptr;
     HWND  searchEdit      = nullptr;
     HWND  viewOfflineChk  = nullptr;
+    HWND  severityCombo   = nullptr;   // v1.3.3 — CVE / EOL severity filter
 
     HWND  hostTable       = nullptr;
     HWND  detailsPanel    = nullptr;
@@ -79,7 +86,7 @@ struct State {
 
     HWND          hSplitter        = nullptr;
     HWND          hTooltip         = nullptr;
-    int           detailsWidthDip  = 390;   // px@96 — user can drag the splitter
+    int           detailsWidthDip  = 460;   // px@96 — user can drag the splitter (v1.5.1: +70 for richer fingerprint sections)
 
     // Ctrl+T full-UI-sweep state. -1 = idle; 0..3 = which dialog index
     // the sweep is currently opening.
@@ -148,7 +155,7 @@ Layout Compute(int cx, int cy, int detailsWidthScaled, bool detailsVisible) {
     L.detailsVisible = detailsVisible;
     if (detailsVisible) {
         int dw = detailsWidthScaled;
-        const int minDw = dpi::Scale(280);
+        const int minDw = dpi::Scale(kDetailsMinDip);
         const int minTable = dpi::Scale(700);
         const int maxDw = cx - L.padR - minTable - dpi::Scale(6) - L.padL;
         if (dw < minDw) dw = minDw;
@@ -592,8 +599,14 @@ void PaintFilterBar(HDC hdc, const Layout& L) {
     PaintLabel(hdc, L.padL, L.filterY, dpi::Scale(40), L.filterH, L"Filter",
                theme::Get(theme::Color::TextSecondary), theme::Fonts().regular);
 
-    // "Search" label — positioned just before the search edit
-    int searchLabelX = L.padL + dpi::Scale(40 + 8 + 150 + 16);
+    // "Search" label — positioned just before the search edit. Layout
+    // arithmetic mirrors the SetWindowPos sequence in Create():
+    //   padL + 40 (Filter label) + 0 (gap)
+    //         + 150 (filter combo width)
+    //         + 8   (gap to severity combo)
+    //         + 160 (severity combo width — v1.3.3)
+    //         + 16  (gap to Search label)
+    int searchLabelX = L.padL + dpi::Scale(40 + 150 + 8 + 160 + 16);
     PaintLabel(hdc, searchLabelX, L.filterY, dpi::Scale(50), L.filterH, L"Search",
                theme::Get(theme::Color::TextSecondary), theme::Fonts().regular);
 
@@ -832,6 +845,26 @@ void FormatTimeLeft(const ScanStats& stats, wchar_t* buf, size_t cap, bool& isCa
 }
 
 
+// Compact human-readable formatter for the probes counter. Raw 58674 /
+// 58674 reads as a wall of digits — on an AllPortsFast /24 the number
+// is in the millions and the eye can't tell 12 845 290 from 12 854 290.
+// Pretty-prints with K / M suffixes:
+//   <    1 000   →  "123"
+//   <   10 000   →  "1.5k"
+//   <  100 000   →  "58.7k"
+//   < 1 000 000  →  "234k"
+//   <   10 mil   →  "1.5M"
+//   ≥  10 mil    →  "16M"
+void FormatCompactCount(long long n, wchar_t* buf, size_t cap) {
+    if (n < 1000)         { swprintf_s(buf, cap, L"%lld", n); return; }
+    const double dn = static_cast<double>(n);
+    if (n < 10000)        { swprintf_s(buf, cap, L"%.1fk", dn / 1000.0); return; }
+    if (n < 100000)       { swprintf_s(buf, cap, L"%.1fk", dn / 1000.0); return; }
+    if (n < 1000000)      { swprintf_s(buf, cap, L"%.0fk", dn / 1000.0); return; }
+    if (n < 10000000)     { swprintf_s(buf, cap, L"%.1fM", dn / 1000000.0); return; }
+    swprintf_s(buf, cap, L"%.0fM", dn / 1000000.0);
+}
+
 // ---------------------------------------------------------------------------
 // Population of KPI cards from the App's stats.
 // ---------------------------------------------------------------------------
@@ -839,17 +872,54 @@ void UpdateKpiCards(State& s) {
     const auto& stats = App::Instance().Stats();
     wchar_t buf[64];
 
-    // Card 0 — Online hosts
+    // Card 0 — Online hosts.
+    //
+    // Mirrors the probes card's "count / total · rate" pattern, but for host
+    // DISCOVERY rather than port probing. The big value stays the online
+    // count (the headline the card is named for); the subtitle carries the
+    // discovery context:
+    //   - while scanning: "{done}/{total} scanned · {hosts/s}" — how far
+    //     through the range, plus the live host-discovery rate. Distinct
+    //     from card 1's probe-based % (on AllPorts presets discovery finishes
+    //     long before the port sweep does).
+    //   - when done:      "of {scanned} hosts · {pct}% up" — the online ratio.
     StatCard::SetLabel(s.kpiCards[0], L"ONLINE HOSTS");
     swprintf_s(buf, L"%d", stats.onlineCount);
     StatCard::SetValue(s.kpiCards[0], buf);
     StatCard::SetAccent(s.kpiCards[0], theme::Get(theme::Color::Success));
-    if (stats.totalScanned > 0) {
-        wchar_t sec[32];
-        swprintf_s(sec, L"of %d hosts", stats.totalScanned);
-        StatCard::SetSecondary(s.kpiCards[0], sec);
-    } else {
-        StatCard::SetSecondary(s.kpiCards[0], L"");
+    {
+        wchar_t sec[96];
+        if (stats.isScanning && stats.progressTotal > 0) {
+            // Host-discovery progress %. The total host count is known
+            // EXACTLY from the parsed range (unlike the probe total, which
+            // is an estimate), so this percentage is precise from the first
+            // tick — a clean "how much of the range is left" indicator. On
+            // AllPorts presets this races to 100 % within seconds while the
+            // SCAN PROGRESS card's probe-based % is still climbing slowly.
+            int pct = static_cast<int>(
+                (long long)stats.progressDone * 100 / stats.progressTotal);
+            if (pct > 100) pct = 100;
+            wchar_t hTotal[24];
+            FormatCompactCount(stats.progressTotal, hTotal, std::size(hTotal));
+            if (stats.hasRecentRate && stats.recentHostsPerSec > 0.5) {
+                wchar_t hRate[24];
+                FormatCompactCount(
+                    static_cast<long long>(stats.recentHostsPerSec + 0.5),
+                    hRate, std::size(hRate));
+                swprintf_s(sec, L"%d%% of %s \xb7 %s/s", pct, hTotal, hRate);
+            } else {
+                swprintf_s(sec, L"%d%% of %s hosts", pct, hTotal);
+            }
+            StatCard::SetSecondary(s.kpiCards[0], sec);
+        } else if (stats.totalScanned > 0) {
+            // Scan finished — show the share of scanned hosts that were up.
+            const int upPct = static_cast<int>(
+                (long long)stats.onlineCount * 100 / stats.totalScanned);
+            swprintf_s(sec, L"%d%% online of %d", upPct, stats.totalScanned);
+            StatCard::SetSecondary(s.kpiCards[0], sec);
+        } else {
+            StatCard::SetSecondary(s.kpiCards[0], L"");
+        }
     }
 
     // Card 1 — Scan progress.
@@ -886,15 +956,24 @@ void UpdateKpiCards(State& s) {
     }
     StatCard::SetAccent(s.kpiCards[1], theme::Get(theme::Color::Accent));
     {
-        // Subtitle: "X / Y probes [· N/s]". Rate suffix only while scanning.
+        // Subtitle: "X / Y probes [· N/s]". Counts formatted compactly
+        // ("58.7k / 58.7k", "1.5M / 16M") because raw decimal digits
+        // become unreadable on AllPorts presets where the totals run
+        // into the millions. Rate suffix only while scanning.
         wchar_t sec[96];
-        const long long pdone  = static_cast<long long>(stats.probesDone);
-        const long long ptotal = static_cast<long long>(stats.probesTotalEstimate);
+        wchar_t hDone[24], hTotal[24];
+        FormatCompactCount(static_cast<long long>(stats.probesDone),
+                           hDone,  std::size(hDone));
+        FormatCompactCount(static_cast<long long>(stats.probesTotalEstimate),
+                           hTotal, std::size(hTotal));
         if (stats.isScanning && stats.recentProbesPerSec > 1.0) {
-            swprintf_s(sec, L"%lld / %lld probes \xb7 %.0f/s",
-                       pdone, ptotal, stats.recentProbesPerSec);
+            wchar_t hRate[24];
+            FormatCompactCount(static_cast<long long>(stats.recentProbesPerSec),
+                               hRate, std::size(hRate));
+            swprintf_s(sec, L"%s / %s probes \xb7 %s/s",
+                       hDone, hTotal, hRate);
         } else {
-            swprintf_s(sec, L"%lld / %lld probes", pdone, ptotal);
+            swprintf_s(sec, L"%s / %s probes", hDone, hTotal);
         }
         StatCard::SetSecondary(s.kpiCards[1], sec);
     }
@@ -1066,6 +1145,27 @@ void CreateChildControls(State& s, HINSTANCE hInst) {
     setFont(s.searchEdit);
     SendMessageW(s.searchEdit, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(L"IP, hostname, vendor, ports\x2026"));
+
+    // v1.3.3 — Severity filter combo. Orthogonal to the main filter
+    // combo above; this one gates rows by the worst-finding severity
+    // produced by SecurityAdvisor. CBS_OWNERDRAWFIXED so dropdown
+    // items can carry a colored dot matching the host-grid row tint
+    // (Critical=red, High=orange, Medium=amber).
+    s.severityCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP
+        | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+        0, 0, 0, 0,
+        s.hwnd, reinterpret_cast<HMENU>(IDC_SEVERITY_COMBO), hInst, nullptr);
+    setFont(s.severityCombo);
+    SendMessageW(s.severityCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1),
+                 static_cast<LPARAM>(dpi::Scale(22)));
+    SendMessageW(s.severityCombo, CB_SETITEMHEIGHT, 0,
+                 static_cast<LPARAM>(dpi::Scale(22)));
+    SendMessageW(s.severityCombo, CB_ADDSTRING, 0, (LPARAM)L"Risk: all");
+    SendMessageW(s.severityCombo, CB_ADDSTRING, 0, (LPARAM)L"Risk: medium+");
+    SendMessageW(s.severityCombo, CB_ADDSTRING, 0, (LPARAM)L"Risk: high+");
+    SendMessageW(s.severityCombo, CB_ADDSTRING, 0, (LPARAM)L"Risk: critical only");
+    SendMessageW(s.severityCombo, CB_SETCURSEL, 0, 0);
 
     // The offline-hosts toggle lives in the View menu now. The checkbox
     // HWND is still created (wired for back-compat) but never shown.
@@ -1313,11 +1413,19 @@ void DoLayout(State& s) {
         int x    = L.padL + dpi::Scale(40);   // after "Filter" label
 
         const int wFilter      = dpi::Scale(150);
+        const int wSeverity    = dpi::Scale(160);   // v1.3.3 — risk filter combo
         const int chipReserve  = dpi::Scale(150);   // room for "999 of 9999 hosts" + padding
         const int wSearchMin   = dpi::Scale(180);
 
         SetWindowPos(s.filterCombo, nullptr, x, y, wFilter, dpi::Scale(200), SWP_NOZORDER);
-        x += wFilter + dpi::Scale(16);
+        x += wFilter + dpi::Scale(8);
+
+        // v1.3.3 — severity filter combo sits directly after the main
+        // filter combo. No label; the items themselves say "Risk: ..."
+        // and the colored dot conveys the option visually.
+        SetWindowPos(s.severityCombo, nullptr, x, y, wSeverity, dpi::Scale(200), SWP_NOZORDER);
+        x += wSeverity + dpi::Scale(16);
+
         // "Search" label painted at x..x+50 by PaintFilterBar
         x += dpi::Scale(50 + 6);
 
@@ -1590,13 +1698,14 @@ void DoStartScan(HWND hwnd, State& s) {
     s.lastStartFailed = false;
     s.userCancelled   = false;
     s.cancelledAtPct  = -1;   // drop any stale "Cancelled · X%"
-    // No more SyncUiFromEngine here — the scanner thread will push the first
-    // snapshot within ~50 ms and trigger the full UI sync via
-    // WM_NL_APPLY_SNAPSHOT. We just repaint the pill so the user sees
-    // immediate feedback that the click registered, AND flip the toolbar
-    // mode right away (Start → Cancel) so the user can interrupt within
-    // the 50 ms window before the first snapshot lands.
-    UpdatePillFromState(s);
+    // Clear the previous scan's results from the screen IMMEDIATELY.
+    // StartScan() already emptied hosts_ / filteredIndex_ / stats_ and reset
+    // the selection; without an explicit sync here the old rows, KPI numbers
+    // and right-pane detail would linger for the ~50 ms until the first
+    // snapshot lands. A full SyncUiFromEngine now repaints the grid empty,
+    // zeroes the KPI cards, blanks the details panel, and flips the toolbar
+    // Start → Cancel so the user can interrupt within that first window.
+    SyncUiFromEngine(hwnd, s, /*dataChanged=*/true);
     SyncToolbarMode(s, /*scanning=*/true);
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -1820,6 +1929,35 @@ void DoCapture(HWND hwnd, State& s) {
     PostMessageW(hwnd, WM_NL_CAPTURE_NEXT, 0, 0);
 }
 
+// Ctrl+W — single-shot capture of ONLY the main window. Saves next to the
+// exe as netlens-main-<ts>.png and opens it in the default image viewer.
+// Distinct from Ctrl+T, which drives the full-UI sweep into a captures-<ts>/
+// folder (main + every dialog). This is the quick "grab what's on screen
+// right now" path. SaveWindowPng falls back to a screen BitBlt when
+// PrintWindow comes back blank, so the main window's custom double-buffered
+// paint is captured correctly as long as it's the visible foreground window
+// (which it is when the user just pressed the shortcut).
+void DoCaptureMainOnly(HWND hwnd) {
+    wchar_t exe[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir(exe, n);
+    size_t pos = dir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) dir.resize(pos);
+
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    wchar_t name[96];
+    swprintf_s(name, L"\\netlens-main-%04d%02d%02d-%02d%02d%02d.png",
+               t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    const std::wstring path = dir + name;
+
+    if (capture::SaveWindowPng(hwnd, path)) {
+        ShellExecuteW(hwnd, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    } else {
+        MessageBeep(MB_ICONERROR);
+    }
+}
+
 // Drives the sweep — one dialog per WM_NL_CAPTURE_NEXT delivery so the
 // nested modal pump runs cleanly between steps.
 void CaptureSweepStep(HWND hwnd, State& s) {
@@ -1921,6 +2059,10 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
             DoCapture(hwnd, s);
             return;
 
+        case IDM_CAPTURE_MAIN:   // Ctrl+W — snap the main window only + open it
+            DoCaptureMainOnly(hwnd);
+            return;
+
         case IDM_VIEW_OFFLINE: {
             // Toggle "Show offline hosts". The state is also mirrored into
             // the hidden checkbox HWND so the rest of the app reads from
@@ -1931,7 +2073,7 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
                          BM_SETCHECK,
                          now ? BST_CHECKED : BST_UNCHECKED, 0);
             HostTable::SetStatusColumnVisible(s.hostTable, now);
-            HostTable::RefreshData(s.hostTable);
+            HostTable::RefreshData(s.hostTable, /*forceRepaint=*/true);
             if (HMENU hm = GetMenu(hwnd)) {
                 CheckMenuItem(hm, IDM_VIEW_OFFLINE,
                               MF_BYCOMMAND | (now ? MF_CHECKED : MF_UNCHECKED));
@@ -2013,7 +2155,9 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
                     if (!h.hostname.empty())   text += L"Hostname: "   + h.hostname   + L"\r\n";
                     if (!h.mac.empty())        text += L"MAC: "        + h.mac        + L"\r\n";
                     if (!h.vendor.empty())     text += L"Vendor: "     + h.vendor     + L"\r\n";
-                    if (!h.deviceType.empty()) text += L"Device: "     + h.deviceType + L"\r\n";
+                    if (!h.deviceType.empty()) text += L"Device Type: " + h.deviceType + L"\r\n";
+                    if (!h.deviceModel.empty() && h.deviceModel != h.printerModel)
+                        text += L"Model: "     + h.deviceModel + L"\r\n";
                     if (!h.openPorts.empty())  text += L"Open TCP ports: " + h.openPorts + L"\r\n";
                     if (!h.services.empty())   text += L"Services: "   + h.services   + L"\r\n";
                     if (!h.brandHint.empty())  text += L"Brand hint: " + h.brandHint  + L"\r\n";
@@ -2026,6 +2170,21 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
                         if (!h.printerSerial.empty()) text += L"Serial: " + h.printerSerial + L"\r\n";
                         if (!h.printerSnmpStatus.empty())
                             text += L"SNMP status: " + h.printerSnmpStatus + L"\r\n";
+                        // v1.4.1 — page / scan counters ("total\tcolor\tmono\tscans").
+                        if (!h.printerPages.empty()) {
+                            std::wstring pf[5]; size_t pp = 0; int pidx = 0;
+                            while (pidx < 5) {
+                                size_t t = h.printerPages.find(L'\t', pp);
+                                pf[pidx++] = h.printerPages.substr(pp,
+                                    t == std::wstring::npos ? std::wstring::npos : t - pp);
+                                if (t == std::wstring::npos) break; pp = t + 1;
+                            }
+                            if (!pf[0].empty()) text += L"Pages printed (life): " + pf[0] + L"\r\n";
+                            if (!pf[1].empty()) text += L"Color pages: " + pf[1] + L"\r\n";
+                            if (!pf[2].empty()) text += L"Mono pages: "  + pf[2] + L"\r\n";
+                            if (!pf[3].empty()) text += L"Scans: "       + pf[3] + L"\r\n";
+                            if (!pf[4].empty()) text += L"Media printed: " + pf[4] + L"\r\n";
+                        }
                         const std::wstring& s = h.printerSupplies;
                         size_t i = 0;
                         while (i < s.size()) {
@@ -2049,6 +2208,30 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
                                 text += L" ("; text += lvl; text += L"/"; text += mx; text += L")";
                             }
                             if (!desc.empty()) { text += L"  \x2014  "; text += desc; }
+                            text += L"\r\n";
+                        }
+                    }
+
+                    // SMB shares block (v1.4.5).
+                    if (!h.smbShares.empty()) {
+                        text += L"\r\n-- SMB shares ----\r\n";
+                        const std::wstring& sh = h.smbShares;
+                        size_t i = 0;
+                        while (i < sh.size()) {
+                            size_t eol = sh.find(L"\r\n", i);
+                            std::wstring line = sh.substr(i,
+                                eol == std::wstring::npos ? std::wstring::npos : eol - i);
+                            i = (eol == std::wstring::npos) ? sh.size() : eol + 2;
+                            if (line.empty()) continue;
+                            std::wstring name, type, remark;
+                            auto take = [&](std::wstring& dst) {
+                                size_t t = line.find(L'\t');
+                                if (t == std::wstring::npos) { dst = line; line.clear(); }
+                                else { dst = line.substr(0, t); line.erase(0, t + 1); }
+                            };
+                            take(name); take(type); remark = line;
+                            text += L"  " + name + L"  (" + type + L")";
+                            if (!remark.empty()) text += L"  \x2014  " + remark;
                             text += L"\r\n";
                         }
                     }
@@ -2107,7 +2290,18 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
                 int sel = static_cast<int>(SendMessageW(s.filterCombo, CB_GETCURSEL, 0, 0));
                 if (sel < 0) sel = 0;
                 App::Instance().SetFilter(static_cast<HostFilter>(sel));
-                HostTable::RefreshData(s.hostTable);
+                HostTable::RefreshData(s.hostTable, /*forceRepaint=*/true);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return;
+
+        case IDC_SEVERITY_COMBO:
+            if (notifyCode == CBN_SELCHANGE) {
+                int sel = static_cast<int>(
+                    SendMessageW(s.severityCombo, CB_GETCURSEL, 0, 0));
+                if (sel < 0) sel = 0;
+                App::Instance().SetMinSeverity(static_cast<SeverityFilter>(sel));
+                HostTable::RefreshData(s.hostTable, /*forceRepaint=*/true);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return;
@@ -2131,7 +2325,7 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
                 wchar_t buf[256]; buf[0] = 0;
                 GetWindowTextW(s.searchEdit, buf, 256);
                 App::Instance().SetSearch(buf);
-                HostTable::RefreshData(s.hostTable);
+                HostTable::RefreshData(s.hostTable, /*forceRepaint=*/true);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return;
@@ -2142,7 +2336,7 @@ void HandleCommand(HWND hwnd, State& s, int id, int notifyCode) {
                 bool view = (chk == BST_CHECKED);
                 App::Instance().SetViewOffline(view);
                 HostTable::SetStatusColumnVisible(s.hostTable, view);
-                HostTable::RefreshData(s.hostTable);
+                HostTable::RefreshData(s.hostTable, /*forceRepaint=*/true);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return;
@@ -2340,13 +2534,22 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NL_APPLY_SNAPSHOT: {
             // Scanner thread posted a snapshot — apply it and refresh UI.
             auto* snap = reinterpret_cast<EngineSnapshot*>(lp);
-            if (!snap) return 0;
+            if (!snap) {
+                App::Instance().ClearSnapshotPending();
+                return 0;
+            }
             State* st = GetState(hwnd);
             if (st) {
                 App::Instance().ApplySnapshot(std::move(*snap));
                 SyncUiFromEngine(hwnd, *st, /*dataChanged=*/true);
             }
             delete snap;
+            // Release back-pressure so the worker thread can build the
+            // next snapshot. Pair with ScanSession::runLoop's
+            // TryMarkSnapshotPending() — kept symmetric even on error
+            // paths above so a transient st==nullptr doesn't strand the
+            // worker.
+            App::Instance().ClearSnapshotPending();
             return 0;
         }
         case WM_NL_SCAN_FINISHED: {
@@ -2469,9 +2672,9 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int newDetailsW = rc.right - (cursorX + splitW) - padR;
             // Re-clamp via Compute()'s logic by going through dip units.
             int newDip = dpi::Unscale(newDetailsW);
-            if (newDip < 390) newDip = 390;   // details-panel min width
+            if (newDip < kDetailsMinDip) newDip = kDetailsMinDip;   // shared min
             int maxDip = dpi::Unscale(rc.right - padR - dpi::Scale(700) - splitW);
-            if (newDip > maxDip && maxDip > 390) newDip = maxDip;
+            if (newDip > maxDip && maxDip > kDetailsMinDip) newDip = maxDip;
             if (newDip != st->detailsWidthDip) {
                 st->detailsWidthDip = newDip;
                 // Invalidate at the OLD layout BEFORE moving anything so
@@ -2540,6 +2743,39 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             SelectObject(hdc, theme::Fonts().regular));
                         RECT rcText = rc;
                         rcText.left += dpi::Scale(6);
+
+                        // v1.3.3 — severity combo carries a colored dot
+                        // before the text (Critical=red, High=orange,
+                        // Medium=amber, All=muted). Match the host-grid
+                        // row tint palette so the visual mapping is
+                        // immediate. The dot is drawn only on the
+                        // severity combo (dis->CtlID).
+                        if (dis->CtlID == IDC_SEVERITY_COMBO) {
+                            COLORREF dotColor = 0;
+                            switch (dis->itemID) {
+                                case 0: dotColor = theme::Get(theme::Color::TextMuted); break;  // All
+                                case 1: dotColor = RGB(0xD9, 0x77, 0x06); break;                // Medium+ amber
+                                case 2: dotColor = RGB(0xEA, 0x58, 0x0C); break;                // High+ orange
+                                case 3: dotColor = RGB(0xDC, 0x26, 0x26); break;                // Critical red
+                                default: dotColor = theme::Get(theme::Color::TextMuted); break;
+                            }
+                            const int dotR = dpi::Scale(5);
+                            const int dotCx = rcText.left + dotR;
+                            const int dotCy = (rc.top + rc.bottom) / 2;
+                            HBRUSH brDot = CreateSolidBrush(dotColor);
+                            HBRUSH oldBr = static_cast<HBRUSH>(
+                                SelectObject(hdc, brDot));
+                            HPEN penDot = CreatePen(PS_SOLID, 1, dotColor);
+                            HPEN oldPen = static_cast<HPEN>(
+                                SelectObject(hdc, penDot));
+                            Ellipse(hdc, dotCx - dotR, dotCy - dotR,
+                                         dotCx + dotR + 1, dotCy + dotR + 1);
+                            SelectObject(hdc, oldBr);
+                            SelectObject(hdc, oldPen);
+                            DeleteObject(brDot);
+                            DeleteObject(penDot);
+                            rcText.left = dotCx + dotR + dpi::Scale(6);
+                        }
                         DrawTextW(hdc, buf, -1, &rcText,
                                   DT_LEFT | DT_VCENTER | DT_SINGLELINE
                                   | DT_NOPREFIX | DT_END_ELLIPSIS);

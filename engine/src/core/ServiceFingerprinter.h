@@ -77,6 +77,111 @@ public:
     static WindowsServerInfo queryWindowsServerInfo(const std::wstring& ip,
                                                     int timeoutMs);
 
+    /// v1.4.5 — Enumerate the SMB shares a host exposes, via the anonymous
+    /// `NetShareEnum` RPC (the same call `net view \\host` makes). Read-only
+    /// reconnaissance — lists share NAMES/types/remarks only, never touches
+    /// file contents and uses no credentials. Returns one TAB-encoded line per
+    /// share: `"<netname>\t<type>\t<remark>"`, where type is "Disk" /
+    /// "Printer" / "Device" (suffixed "(hidden)" for the admin/special `$`
+    /// shares). The IPC$ pipe share is filtered out. Empty when the host
+    /// blocks anonymous enumeration (modern Windows default) — NAS boxes and
+    /// Samba/older servers usually allow it. Runs on an abandonable worker
+    /// thread (NetShareEnum has no timeout), so a stuck RPC never stalls the
+    /// scan. Caller should only invoke when TCP 445 is open.
+    static std::vector<std::wstring> queryShares(const std::wstring& ip,
+                                                 int timeoutMs);
+
+    /// Raw SMB protocol-level dialect probe over TCP 445. Walks the
+    /// whole SMB family (SMB1 LANMAN dialects through SMB 3.1.1) and
+    /// reports the highest dialect the server actually picks. Works
+    /// across IPSEC site-to-site tunnels and other routed paths where
+    /// `NetServerGetInfo` silently fails (the Windows networking stack
+    /// bakes an NBNS broadcast into its name-resolution step that
+    /// doesn't traverse the tunnel).
+    ///
+    /// Probe order:
+    ///   1. SMB2 NEGOTIATE with dialects 0x0202..0x0311 + Negotiate
+    ///      Contexts (preauth integrity + encryption capabilities).
+    ///      Modern Windows hosts pick 0x0311; older boxes downgrade.
+    ///   2. If SMB2 NEGOTIATE was rejected (e.g. SMB2-disabled host),
+    ///      fall back to SMB1 SMB_COM_NEGOTIATE offering ten classic
+    ///      dialect strings and read the selected dialect index back.
+    ///
+    /// The fingerprint focuses on the SMB version itself
+    /// (`product=SMB`, `version=3.1.1` / `2.0.2` / `1.0 (NT LM 0.12)`
+    /// etc.). The detail string carries the dialect name + a coarse
+    /// Windows-version hint as supplementary info, NOT as the primary
+    /// payload. Callers should only invoke this when TCP 445 is open.
+    static ServiceFingerprint queryWindowsSmbDialect(const std::wstring& ip,
+                                                     int timeoutMs);
+
+    /// v1.4.1 — Zebra label/barcode printers rarely populate the standard
+    /// Printer-MIB (prtMarkerSupplies / prtMarkerLifeCount), but every modern
+    /// Zebra speaks SGD (Set-Get-Do) over raw TCP 9100. We send a small batch
+    /// of `! U1 getvar "..."` queries and parse the quoted replies. This is
+    /// the Zebra-native way to read firmware, model, and the lifetime label /
+    /// print-length odometer — and it works even when SNMP is disabled or
+    /// locked to a non-default community. ONLY call this for a host already
+    /// confirmed to be Zebra (vendor / OUI / sysDescr), because the SGD bytes
+    /// would otherwise be interpreted as a print job by a non-Zebra 9100.
+    struct ZebraStatus {
+        bool         responded  = false;
+        std::wstring firmware;     ///< appl.name (e.g. "V72.20.04Z")
+        std::wstring model;        ///< device.product_name (e.g. "ZT411-203dpi")
+        int64_t      labelCount = -1;   ///< odometer.total_label_count
+        std::wstring printLength;  ///< odometer.total_print_length (with units)
+    };
+    static ZebraStatus queryZebraStatus(const std::wstring& ip, int timeoutMs);
+
+    /// v1.5.0 — Xiaomi miIO discovery "hello" on UDP 54321. Defensive
+    /// inventory only: sends the well-known 32-byte handshake and parses the
+    /// reply. Reveals the device id and a stamp/timestamp WITHOUT a token; on
+    /// very old / unprovisioned firmware the last 16 bytes leak the device
+    /// token (we flag that as a finding but never use it to send commands).
+    /// Model / firmware are NOT obtainable here — they require an
+    /// authenticated miIO.info call with the real token. Newer Roborock
+    /// devices abandoned miIO for an encrypted protocol on TCP 58867 and will
+    /// simply not respond (responded == false). No control commands are ever
+    /// sent.
+    struct MiioHello {
+        bool         responded    = false;
+        uint32_t     deviceId     = 0;
+        uint32_t     stamp        = 0;
+        bool         tokenExposed = false;  // last 16 bytes not all 0xFF / 0x00
+        std::wstring tokenHex;              // populated only when exposed
+    };
+    static MiioHello queryMiioHello(const std::wstring& ip, int timeoutMs);
+
+    /// v1.5.0 — single dedicated TCP connect check, timeout-bounded. Used to
+    /// confirm a port the parallel scan may have missed (IoT devices with tiny
+    /// TCP stacks often drop the fast sweep's short-timeout probes). Connect
+    /// only — sends nothing, closes immediately.
+    static bool tcpConnectable(const std::wstring& ip, int port, int timeoutMs);
+
+    /// v1.5.5 — Is `s` shaped like a Ubiquiti/UniFi model SKU (e.g. "U6-LR",
+    /// "UAP-AC-Pro", "USW-24-PoE", "UDM-Pro")? Fail-closed: a string with a
+    /// space or without a known UniFi family prefix is NOT a model. Used to
+    /// (a) trust a device's self-reported hostname as its model — UniFi sets
+    /// the default hostname to the SKU — and (b) keep that SKU out of the
+    /// Hostname column, where it would masquerade as a network name.
+    static bool looksLikeUnifiModel(const std::wstring& s);
+
+    /// v1.5.1 — Ubiquiti UBNT Discovery on UDP 10001 (read-only inventory).
+    /// Sends the 4-byte v1 discovery request and parses the TLV reply, which
+    /// (when the device answers — typically unadopted UniFi gear and UniFi
+    /// controllers) exposes model code, firmware, hostname and uptime WITHOUT
+    /// authentication. Adopted UniFi devices often stay silent (responded ==
+    /// false) — their model/firmware then need authenticated SSH or SNMP.
+    struct UbntInfo {
+        bool         responded = false;
+        std::wstring modelCode;   // e.g. "U7PG2"
+        std::wstring modelName;   // friendly, mapped or device-reported
+        std::wstring firmware;    // e.g. "BZ.qca956x.v3.7.58..."
+        std::wstring hostname;
+        uint32_t     uptime = 0;  // seconds
+    };
+    static UbntInfo queryUbntDiscovery(const std::wstring& ip, int timeoutMs);
+
     /// This machine's own computer name (`GetComputerName`) — a local, instant,
     /// network-free hostname source, used as the fallback for the scanning host
     /// itself (which the SMB probes deliberately skip).

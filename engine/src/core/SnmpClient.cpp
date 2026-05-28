@@ -166,7 +166,7 @@ bool decLen(const uint8_t*& p, const uint8_t* end, size_t& outLen) {
     if ((b & 0x80) == 0) { outLen = b; return true; }
     int n = b & 0x7F;
     if (n == 0 || n > 4) return false;
-    if (p + n > end) return false;
+    if (n > static_cast<int>(end - p)) return false;   // subtraction: no OOB ptr
     size_t len = 0;
     for (int i = 0; i < n; ++i) len = (len << 8) | *p++;
     outLen = len;
@@ -222,13 +222,16 @@ bool decVarbind(const uint8_t*& p, const uint8_t* end, Value& out) {
     if (p >= end || *p++ != TAG_SEQUENCE) return false;
     size_t vbLen = 0;
     if (!decLen(p, end, vbLen)) return false;
+    // Bound via subtraction so we never form an out-of-bounds pointer (vbLen
+    // can be up to ~4 GB from a 4-byte BER length; `p + vbLen` would be UB).
+    if (vbLen > static_cast<size_t>(end - p)) return false;
     const uint8_t* vbEnd = p + vbLen;
-    if (vbEnd > end) return false;
 
     // OID
     if (p >= vbEnd || *p++ != TAG_OID) return false;
     size_t oidLen = 0;
-    if (!decLen(p, vbEnd, oidLen) || p + oidLen > vbEnd) return false;
+    if (!decLen(p, vbEnd, oidLen)
+        || oidLen > static_cast<size_t>(vbEnd - p)) return false;
     out.oid = decOidBody(p, oidLen);
     p += oidLen;
 
@@ -236,7 +239,8 @@ bool decVarbind(const uint8_t*& p, const uint8_t* end, Value& out) {
     if (p >= vbEnd) return false;
     uint8_t valTag = *p++;
     size_t valLen = 0;
-    if (!decLen(p, vbEnd, valLen) || p + valLen > vbEnd) return false;
+    if (!decLen(p, vbEnd, valLen)
+        || valLen > static_cast<size_t>(vbEnd - p)) return false;
     const uint8_t* valData = p;
     p += valLen;
 

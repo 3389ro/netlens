@@ -266,6 +266,28 @@ struct ScanResult {
     //   "<color>\t<type>\t<percent>\t<level>\t<max>\t<description>"
     // The percent column is "—" when unknown.
     std::wstring             printerSupplies;
+    // v1.4.1 — lifetime page / scan counters, TAB-separated:
+    //   "<total>\t<color>\t<mono>\t<scans>"  (each empty when unknown).
+    std::wstring             printerPages;
+
+    // v1.4.5 — exposed SMB shares from anonymous NetShareEnum. One share per
+    // "\r\n"-line, TAB columns: "<netname>\t<type>\t<remark>". Empty when the
+    // host blocks anonymous enumeration or has no SMB.
+    std::wstring             smbShares;
+
+    // v1.5.0 — IoT (Roborock/Xiaomi robot-vacuum) fingerprint. Empty unless
+    // the host is a candidate. First line is "<score>\t<label>"; subsequent
+    // "\r\n"-lines are evidence/detail strings shown verbatim in the UI.
+    std::wstring             iotFingerprint;
+
+    // v1.3.2 — heuristic security findings populated by SecurityAdvisor
+    // after the fingerprint pass. Multi-line; one finding per line, tab-
+    // separated columns:
+    //   severity \t id \t title \t url
+    // Severity ∈ { "critical", "high", "medium", "low" }.
+    // Ordering: critical first, then high, then EOL/medium/low.
+    // Empty string when no rule matched.
+    std::wstring             securityFindings;
 
     [[nodiscard]] std::wstring statusText() const { return isOnline ? L"Online" : L"Offline"; }
 
@@ -463,6 +485,15 @@ struct ScanOptions {
     // DeviceClassifier as the strongest "this host is the router" signal.
     // Empty for manual ranges with no adapter selected.
     std::wstring  gatewayIp;
+
+    // v1.3.6 — Count of leading "priority" addresses in the reordered scan
+    // list (tier 1 = the local /24, tier 2 = scout candidates .1/.254/.255
+    // of every other /24). When > 0, executeScanLoop uses a dynamic priority
+    // queue instead of the plain sequential atomic counter: the priority
+    // addresses dispatch first, and as soon as a scout (or any host) in a
+    // remote /24 responds, that whole /24 is promoted ahead of the still-dead
+    // subnets. 0 means "no tiering — scan the list straight through".
+    size_t        priorityCount   = 0;
 };
 
 // -----------------------------------------------------------------------------

@@ -68,6 +68,7 @@ set(ENGINE_SOURCES
     src/core/LocalProcessResolver.cpp
     src/core/DeviceClassifier.cpp
     src/core/RiskAnalyzer.cpp
+    src/core/SecurityAdvisor.cpp
     src/core/BaselineStore.cpp
     src/core/ReportExporter.cpp
     src/core/HostMonitor.cpp

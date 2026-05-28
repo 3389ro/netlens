@@ -34,6 +34,51 @@ bool vendorIs(const std::wstring& vLower, std::initializer_list<const wchar_t*> 
     return false;
 }
 
+// v1.5.5 — best-effort EXACT model for the host-grid "Model" column and the
+// CSV / HTML exports. Computed once in finalize() (after every probe has run)
+// so all consumers agree. Emits a value only from a high-confidence source —
+// never a guess; an empty result is the correct answer for an unidentified box.
+// Priority, strongest first:
+//   1. SNMP Printer-MIB / hrDeviceDescr model (only when classified printer).
+//   2. ESXi/vSphere exact build from the host's own /sdk/vimServiceVersions.xml
+//      (vsphere fingerprint version), shown as "ESXi <X.Y.Z>".
+//   3. Ubiquiti / UniFi model from the read-only UBNT-discovery blob's
+//      "Model: <name>" line ("Model code:" deliberately does NOT match).
+//   4. DeviceClassifier's early best-effort model (mgmt-UI product+version or a
+//      cleaned, non-generic web <title>) as the fallback.
+std::wstring bestDeviceModel(const ScanResult& r) {
+    if (r.isPrinter && !r.printerModel.empty())
+        return r.printerModel;
+
+    for (const auto& f : r.fingerprints) {
+        const bool esxi = f.service == L"vsphere"
+                       || f.product.find(L"ESXi") != std::wstring::npos;
+        if (esxi && !f.version.empty()
+            && f.version[0] >= L'0' && f.version[0] <= L'9')
+            return L"ESXi " + f.version;
+    }
+
+    if (!r.iotFingerprint.empty()) {
+        const std::wstring& blob = r.iotFingerprint;
+        const std::wstring key = L"Model: ";
+        size_t pos = 0;
+        while (pos < blob.size()) {
+            size_t nl  = blob.find(L"\r\n", pos);
+            size_t len = (nl == std::wstring::npos) ? std::wstring::npos
+                                                    : nl - pos;
+            std::wstring line = blob.substr(pos, len);
+            if (line.compare(0, key.size(), key) == 0) {
+                std::wstring name = line.substr(key.size());
+                if (!name.empty()) return name;
+            }
+            if (nl == std::wstring::npos) break;
+            pos = nl + 2;
+        }
+    }
+
+    return r.deviceModel;
+}
+
 // Pull a brand name out of WebUiProbe's prefixed model string. Used when
 // the MAC-OUI vendor lookup failed (remote subnet, ARP unreachable) so
 // the GUI's Vendor column still shows SOMETHING and the router-brand
@@ -906,6 +951,13 @@ void EnrichmentEngine::finalize(ScanResult& r) {
     r.osHintCached       = osHintForHost(r);
     r.deviceHintCached   = deviceHintForHost(r);
     r.brandHint          = brandHintAggregate(r);
+
+    // 2.5) Best-effort EXACT model for the Model column and the CSV / HTML
+    //      exports. Runs here — after every probe — so the printer-SNMP,
+    //      ESXi-SDK and UBNT-discovery models are all available. Upgrades the
+    //      classifier's early web-title guess only when a stronger source
+    //      exists; otherwise it leaves r.deviceModel unchanged.
+    r.deviceModel = bestDeviceModel(r);
 
     // 3) Per-fingerprint version annotation.
     for (auto& f : r.fingerprints) {

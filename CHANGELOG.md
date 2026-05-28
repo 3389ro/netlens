@@ -4,6 +4,80 @@ All notable changes to the project, version by version. Each entry maps to
 the matching tag and `release/<version>/NetLens.exe` binary on the
 [Releases page](https://github.com/3389ro/netlens/releases).
 
+## [1.5.13] — 2026-05-28
+
+**Theme: deeper device fingerprinting, security findings, and large-scan stability.**
+
+This release adds a security-findings layer, much richer device
+identification (including a dedicated Model column), and a round of
+performance and reliability work for large ranges and long-running scans.
+
+### Added
+
+- **Security findings** panel with curated CVE / EOL heuristics derived from
+  observable service banners, fingerprints and version hints. Surfaced in the
+  details pane and the HTML report.
+- **SMB dialect detection** through direct SMB negotiation, covering SMB 1.0 /
+  2.x / 3.x, plus **anonymous SMB share enumeration** when the host permits it.
+- **Printer enrichment over SNMP**: vendor / model / serial, per-cartridge
+  supply levels with colour-coded progress bars, and lifetime page / scan
+  counters. Label printers that keep SNMP disabled are read over native
+  **Zebra SGD (TCP 9100)** for model, firmware and odometer.
+- **Device fingerprinting** for Roborock / Xiaomi, Ubiquiti / UniFi,
+  VMware ESXi, HPE iLO, Netgear switches, Yealink phones, Thecus / Synology
+  NAS and TP-Link / MikroTik routers.
+- **Model column** in the host grid, HTML report and CSV export — with
+  Device Type and exact Model shown as separate fields.
+- **Exact model / version reading** for selected device classes from
+  read-only, unauthenticated endpoints: HPE iLO product + firmware
+  (`/xmldata`), TP-Link business routers (LuCI locale API), MikroTik RouterOS
+  version, and the VMware ESXi build.
+
+### Improved
+
+- **Faster useful results on large ranges** (/22–/20): local-subnet priority,
+  gateway / scout ordering, and dynamic promotion of subnets that show signs
+  of life — so populated segments surface first.
+- **Responsive UI on big scans**: an O(1) result accumulator and repaint
+  throttling keep the grid fluid with thousands of online hosts; grid and
+  details-panel scrolling, KPI updates and selection stay stable during live
+  updates, with selection following the host's IP across mid-scan re-sorts
+  and the end-of-scan reshuffle.
+- **More accurate classification** by separating Device Type from exact Model,
+  backed by a strict, manufacturer-driven model resolver that never presents a
+  raw or placeholder web-page title as a model.
+- **Broader Full Common coverage** for common admin, printer, IoT, VPN, MFT
+  and web-management ports.
+- **Faster Stop** on slow, firewalled or VPN hosts.
+
+### Fixed
+
+- Several scan-engine stability issues around DNS-worker limits, snapshot
+  back-pressure, cancel handling, restart and result-clearing races, and
+  thread-creation / shutdown safety.
+- Removed an incorrect "critical" SMB1 / EternalBlue finding that could fire on
+  ordinary SMB 2.1 hosts (Windows 7 / Server 2008 R2 / 2012 and many NAS
+  devices).
+- Removed incorrect printer classification on HPE iLO and server / switch
+  hardware.
+- Stopped misleading model strings sourced from placeholder web titles or
+  generic HTTP server headers.
+- Corrected Ubiquiti model handling so a device SKU no longer leaks into the
+  Hostname field, and made UDP discovery retries more reliable.
+- Hardened report and export safety: HTML escaping across every field, a CSV
+  formula-injection guard, and codepoint-safe UTF-8 handling at the engine
+  boundary.
+
+### Notes
+
+- All fingerprinting is **read-only and defensive**: no brute force, no exploit
+  attempts, no configuration changes.
+- Security findings are **heuristic** indicators based on banners, service
+  fingerprints and observable version hints — they show where to look, not
+  proof of exploitability.
+- Single self-contained x64 `.exe`: static CRT, no installer, no registry or
+  `%APPDATA%` writes, no telemetry.
+
 ## [1.3.0] — 2026-05-26
 
 **Theme: native Win32 rewrite + scan-engine fork.**

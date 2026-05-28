@@ -42,7 +42,8 @@ HANDLE getThreadIcmpHandle() {
 
 } // anonymous namespace
 
-PingService::Result PingService::ping(uint32_t hostOrderIp, int timeoutMs) {
+PingService::Result PingService::ping(uint32_t hostOrderIp, int timeoutMs,
+                                      const std::atomic<bool>* cancel) {
     Result out{};
 
     if (timeoutMs <= 0) timeoutMs = 400;
@@ -69,6 +70,12 @@ PingService::Result PingService::ping(uint32_t hostOrderIp, int timeoutMs) {
     // gap (≤ timeoutMs/2) recovers most of these without bloating the
     // total scan time.
     for (int attempt = 0; attempt < 2; ++attempt) {
+        // Honour a cancel between attempts so a Stop during a scan doesn't pay
+        // the full second-attempt timeout on every in-flight ping.
+        if (attempt > 0 && cancel
+            && cancel->load(std::memory_order_relaxed)) {
+            break;
+        }
         DWORD perAttemptTimeout = static_cast<DWORD>(
             attempt == 0 ? timeoutMs : (timeoutMs * 3 / 2));
         DWORD ret = ::IcmpSendEcho(

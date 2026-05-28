@@ -19,6 +19,15 @@ constexpr const char* kSysDescr   = "1.3.6.1.2.1.1.1.0";
 constexpr const char* kSysObjID   = "1.3.6.1.2.1.1.2.0";
 constexpr const char* kSysName    = "1.3.6.1.2.1.1.5.0";
 
+// Clean cross-vendor model strings (no credentials). Verified on HP/Xerox/
+// Brother/Canon/Kyocera: both return e.g. "HP Color LaserJet MFP M477fnw"
+// while sysDescr is the verbose "...MULTI-ENVIRONMENT,SN:...,PID:..." blob.
+//   hrDeviceDescr.1          (Host-Resources-MIB) — the device model
+//   prtGeneralPrinterName.1  (Printer-MIB)        — printer name (model unless
+//                                                   an admin renamed it)
+constexpr const char* kHrDeviceDescr = "1.3.6.1.2.1.25.3.2.1.3.1";
+constexpr const char* kPrtPrinterName = "1.3.6.1.2.1.43.5.1.1.16.1";
+
 // prtMarkerSupplies subtree — one row per consumable, columns under
 // 1.3.6.1.2.1.43.11.1.1.<column>.<hrDeviceIndex>.<prtMarkerSuppliesIndex>.
 constexpr const char* kPrtMarkerSuppliesTable = "1.3.6.1.2.1.43.11.1.1";
@@ -28,8 +37,57 @@ constexpr int kColMarkerDescr    = 6;   // prtMarkerSuppliesDescription (string)
 constexpr int kColMarkerMaxCap   = 8;   // prtMarkerSuppliesMaxCapacity (int)
 constexpr int kColMarkerLevel    = 9;   // prtMarkerSuppliesLevel (int)
 
+// prtMarkerLifeCount — total impressions over the device's life, RFC 3805
+// standard, one row per marker as ...43.10.2.1.4.<hrDeviceIndex>.<markerIndex>.
+// Walked as a subtree; we take the largest value as the device total (a
+// multi-marker device reports the engine total on at least one marker).
+constexpr const char* kPrtMarkerLifeCountTable = "1.3.6.1.2.1.43.10.2.1.4";
+
 // Serial number — best-effort, sometimes under hrDevice / prtGeneral.
 constexpr const char* kPrtGeneralSerial = "1.3.6.1.2.1.43.5.1.1.17.1";
+
+// =============================================================================
+// Vendor-specific page / scan counters (best-effort).
+//
+// There is NO RFC standard for the color/mono split or for scan counts, so
+// these are per-vendor private-MIB OIDs gathered from each vendor's published
+// SNMP references. They're queried only when our sysDescr-derived vendor
+// matches, and a value is accepted only when the agent returns a plausible
+// non-negative Counter/Integer. Anything unknown stays -1 and is simply not
+// shown — we never fabricate a number.
+// =============================================================================
+struct VendorCounters {
+    const wchar_t* vendor;   // matched against PrinterInfo::vendor
+    const char*    colorOid; // nullptr = not known for this vendor
+    const char*    monoOid;
+    const char*    scanOid;
+};
+constexpr VendorCounters kVendorCounters[] = {
+    // HP — CPCA / private printer MIB life counters.
+    { L"HP",
+      "1.3.6.1.4.1.11.2.3.9.4.2.1.4.1.2.6.0",   // color impressions
+      "1.3.6.1.4.1.11.2.3.9.4.2.1.4.1.2.5.0",   // mono impressions
+      "1.3.6.1.4.1.11.2.3.9.4.2.1.4.1.5.1.1.0"  // total scans (MFP)
+    },
+    // Kyocera — private counter group.
+    { L"Kyocera",
+      "1.3.6.1.4.1.1347.42.2.1.1.1.6.1.1",      // color total
+      "1.3.6.1.4.1.1347.42.2.1.1.1.5.1.1",      // mono total
+      "1.3.6.1.4.1.1347.46.10.1.1.5.1"          // scan total
+    },
+    // Ricoh — engine counter group (color/bw).
+    { L"Ricoh",
+      "1.3.6.1.4.1.367.3.2.1.2.19.5.1.9.2",     // color
+      "1.3.6.1.4.1.367.3.2.1.2.19.5.1.9.1",     // mono
+      nullptr
+    },
+    // Konica Minolta bizhub — total counter group.
+    { L"Konica Minolta",
+      "1.3.6.1.4.1.18334.1.1.1.5.7.2.1.5.1.2",  // color
+      "1.3.6.1.4.1.18334.1.1.1.5.7.2.1.5.1.1",  // mono
+      nullptr
+    },
+};
 
 // =============================================================================
 // String helpers
@@ -196,8 +254,18 @@ PrinterInfo PrinterSnmpScanner::probe(uint32_t hostOrderIp,
                                        bool wantSupplies,
                                        const std::atomic<bool>& cancel) {
     PrinterInfo info;
-    info.isPrinter = signals.any();
-    if (!info.isPrinter) return info;
+    // Real printer evidence — NOT vendor alone. HP/HPE are also iLO baseboard
+    // management, ProLiant servers and switches; Canon is also cameras. So a
+    // bare vendor match must NOT light up "Printer / PRINTER SUPPLIES". Only a
+    // printer PORT (9100 JetDirect / 515 LPR / 631 IPP) or the classifier
+    // already saying "Printer" counts as evidence up front; the SNMP model /
+    // supplies below can still promote a vendor-only candidate that turns out
+    // to be a real printer (e.g. an AIO exposing only 80/443).
+    const bool printerPorts = signals.port9100 || signals.port515 || signals.port631;
+    info.isPrinter = printerPorts || signals.deviceClass;
+    // Probe SNMP for any candidate (incl. a vendor match) so we can confirm,
+    // but if it isn't even a candidate, stop here.
+    if (!signals.any()) return info;
     info.snmpStatus = PrinterSnmpStatus::Unavailable;
     // Default 500ms (was 800ms). Healthy printers respond to SNMP GET in
     // < 50 ms; the larger budget mainly slowed Cancel response because
@@ -206,9 +274,10 @@ PrinterInfo PrinterSnmpScanner::probe(uint32_t hostOrderIp,
     // unresponsive printers while still leaving headroom for LAN jitter.
     if (timeoutMs <= 0) timeoutMs = 500;
 
-    // ---- 1) System group: sysDescr / sysName / sysObjectID ----
+    // ---- 1) System group + clean model OIDs ----
     auto sys = snmp::get(hostOrderIp,
-                          { kSysDescr, kSysName, kSysObjID },
+                          { kSysDescr, kSysName, kSysObjID,
+                            kHrDeviceDescr, kPrtPrinterName },
                           timeoutMs);
     if (cancel.load(std::memory_order_relaxed)) return info;
 
@@ -219,6 +288,7 @@ PrinterInfo PrinterSnmpScanner::probe(uint32_t hostOrderIp,
     }
 
     // Map varbinds back to friendly fields.
+    std::wstring hrDesc, prtName;
     for (const auto& v : sys.values) {
         if (v.isException) continue;
         if (v.oid == kSysDescr) {
@@ -227,10 +297,47 @@ PrinterInfo PrinterSnmpScanner::probe(uint32_t hostOrderIp,
         } else if (v.oid == kSysName) {
             info.sysName = utf8To(v.asText);
             trimText(info.sysName);
+        } else if (v.oid == kHrDeviceDescr) {
+            hrDesc = utf8To(v.asText); trimText(hrDesc);
+        } else if (v.oid == kPrtPrinterName) {
+            prtName = utf8To(v.asText); trimText(prtName);
         }
     }
     info.vendor = guessVendor(info.sysDescr, info.sysName);
-    info.model  = guessModel (info.sysDescr, info.vendor);
+
+    // Exact model — prefer the clean standard-MIB strings over the verbose
+    // sysDescr. hrDeviceDescr is the device model (not admin-renamable), so
+    // it wins; prtGeneralPrinterName is the fallback (usually the model too,
+    // unless an admin set a custom name). Reject the sysDescr-style blob and
+    // a value that just echoes the SNMP sysName / hostname.
+    auto looksLikeModel = [&](const std::wstring& s) {
+        if (s.empty() || s.size() >= 80) return false;
+        if (s == info.sysName) return false;
+        if (icontains(s, L"MULTI-ENVIRONMENT") || icontains(s, L"SN:")) return false;
+        return true;
+    };
+    if      (looksLikeModel(hrDesc))  info.model = hrDesc;
+    else if (looksLikeModel(prtName)) info.model = prtName;
+    else                              info.model = guessModel(info.sysDescr, info.vendor);
+
+    // Promote a vendor-only candidate to "printer" when SNMP named an actual
+    // printer family — catches AIOs exposing only 80/443, and ensures an iLO
+    // (model "Integrated Lights-Out", no printer keyword) is NOT flagged.
+    auto printerKeyword = [](const std::wstring& s) {
+        return icontains(s, L"laserjet")  || icontains(s, L"officejet")
+            || icontains(s, L"deskjet")   || icontains(s, L"designjet")
+            || icontains(s, L"workcentre")|| icontains(s, L"versalink")
+            || icontains(s, L"altalink")  || icontains(s, L"imageclass")
+            || icontains(s, L"imagerunner")||icontains(s, L"pixma")
+            || icontains(s, L"ecosys")    || icontains(s, L"taskalfa")
+            || icontains(s, L"workforce") || icontains(s, L"ecotank")
+            || icontains(s, L"bizhub")    || icontains(s, L"mfc-")
+            || icontains(s, L"dcp-")      || icontains(s, L" mfp")
+            || icontains(s, L"printer");
+    };
+    if (printerKeyword(info.model) || printerKeyword(info.sysDescr)
+     || printerKeyword(hrDesc)     || printerKeyword(prtName))
+        info.isPrinter = true;
 
     // ---- 2) Serial number (best-effort) ----
     auto sn = snmp::get(hostOrderIp, { kPrtGeneralSerial }, timeoutMs);
@@ -292,11 +399,16 @@ PrinterInfo PrinterSnmpScanner::probe(uint32_t hostOrderIp,
         }
     }
 
-    // Convert rows to supplies. Skip rows with no description AND no level
-    // (likely truncated walks).
+    // Convert rows to supplies. v1.4.1 — keep a row if it carries ANY usable
+    // signal (description, a readable level, a max-capacity, or a known marker
+    // type). Previously a row was dropped unless it had a description OR a
+    // level >= 0, so printers that report supply *type* + *capacity* but leave
+    // the description blank and the level at the -2 "unknown" sentinel showed
+    // up as "no supplies" even though the consumables were enumerable.
     for (auto& kv : rows) {
         const Row& r = kv.second;
-        if (r.descr.empty() && r.level < 0) continue;
+        if (r.descr.empty() && r.level < 0 && r.maxCap < 0 && r.markerType < 0)
+            continue;
         PrinterSupply s;
         s.description = r.descr;
         // Type/color normalization. We compose "Toner Black" / "Drum" /
@@ -324,7 +436,65 @@ PrinterInfo PrinterSnmpScanner::probe(uint32_t hostOrderIp,
         info.supplies.push_back(std::move(s));
     }
 
-    if (!info.supplies.empty()) info.snmpStatus = PrinterSnmpStatus::Ok;
+    if (!info.supplies.empty()) {
+        info.snmpStatus = PrinterSnmpStatus::Ok;
+        info.isPrinter  = true;   // enumerable consumables = definitely a printer
+    }
+
+    // ---- 4) Lifetime page / scan counters --------------------------------
+    //
+    // prtMarkerLifeCount (standard) gives the total impressions; the
+    // color/mono/scan split is vendor-specific and best-effort. These run
+    // even when the supply table was empty — a printer that hides its
+    // consumables often still reports its page count, which is exactly the
+    // "imprimanta history" the operator wants.
+    if (cancel.load(std::memory_order_relaxed)) return info;
+
+    auto lifeWalk = snmp::walk(hostOrderIp, kPrtMarkerLifeCountTable,
+                               timeoutMs, /*maxValues=*/16, cancel);
+    if (lifeWalk.status == snmp::Status::Ok) {
+        int64_t best = -1;
+        for (const auto& v : lifeWalk.values) {
+            if (v.isException) continue;
+            if (v.type == snmp::ValueType::Integer
+             || v.type == snmp::ValueType::Counter32
+             || v.type == snmp::ValueType::Gauge32) {
+                if (v.asInt > best) best = v.asInt;
+            }
+        }
+        if (best >= 0) info.pagesTotal = best;
+    }
+
+    // Vendor private color / mono / scan counters — only for a matched vendor.
+    auto readCounter = [&](const char* oid) -> int64_t {
+        if (!oid) return -1;
+        if (cancel.load(std::memory_order_relaxed)) return -1;
+        auto g = snmp::get(hostOrderIp, { oid }, timeoutMs);
+        if (g.status != snmp::Status::Ok || g.values.empty()) return -1;
+        const auto& v = g.values.front();
+        if (v.isException) return -1;
+        if (v.type == snmp::ValueType::Integer
+         || v.type == snmp::ValueType::Counter32
+         || v.type == snmp::ValueType::Gauge32) {
+            return v.asInt >= 0 ? v.asInt : -1;
+        }
+        return -1;
+    };
+    for (const auto& vc : kVendorCounters) {
+        if (info.vendor != vc.vendor) continue;
+        info.pagesColor = readCounter(vc.colorOid);
+        info.pagesMono  = readCounter(vc.monoOid);
+        info.scansTotal = readCounter(vc.scanOid);
+        break;
+    }
+
+    // A page count is itself proof the SNMP printer stack is healthy — promote
+    // status out of "no supplies" so the UI shows the printer as fully read.
+    if (info.snmpStatus == PrinterSnmpStatus::NoSupplies
+        && (info.pagesTotal >= 0 || info.scansTotal >= 0)) {
+        info.snmpStatus = PrinterSnmpStatus::Ok;
+    }
+
     return info;
 }
 

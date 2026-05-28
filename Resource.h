@@ -38,6 +38,7 @@
 
 // Accelerator-only commands (not in any menu)
 #define IDM_FOCUS_SEARCH           1300
+#define IDM_CAPTURE_MAIN           1301  // Ctrl+W — snap main window only + open
 
 // M5.13 — Host-grid right-click context menu commands.
 #define IDM_CTX_PING               1400
@@ -68,6 +69,7 @@
 #define IDC_FILTER_COMBO           2101
 #define IDC_SEARCH_EDIT            2102
 #define IDC_VIEW_OFFLINE_CHK       2103
+#define IDC_SEVERITY_COMBO         2104   // v1.3.3 — CVE / EOL severity filter
 
 // Main child controls
 #define IDC_KPI_ONLINE             2201

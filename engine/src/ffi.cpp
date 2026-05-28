@@ -22,12 +22,14 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace lanscope;
@@ -64,29 +66,25 @@ void copyUtf8(char* dst, int cap, const std::wstring& w) {
     if (!dst || cap <= 0) return;
     std::string s = wToUtf8(w);
     int n = static_cast<int>(s.size());
-    if (n > cap - 1) n = cap - 1;
-    // Don't truncate mid-codepoint. UTF-8 continuation bytes have the
-    // high two bits set to 10 (0x80..0xBF); walk back from the cut point
-    // until we land on a single-byte ASCII (0xxxxxxx) or a leading byte
-    // (11xxxxxx). The C# / Win32 decoder then sees clean codepoints
-    // rather than a stray continuation that decodes as the replacement
-    // character at the tail.
-    while (n > 0 && static_cast<unsigned char>(s[n - 1]) >= 0x80
-                 && static_cast<unsigned char>(s[n - 1])  < 0xC0) {
-        --n;
-    }
-    // Also drop a leading byte if we're about to leave it without its
-    // continuation bytes (e.g. a 3-byte sequence with only 1 or 2 bytes
-    // remaining inside the cap).
-    if (n > 0) {
-        unsigned char c = static_cast<unsigned char>(s[n - 1]);
-        int expected = 0;
-        if      ((c & 0xE0) == 0xC0) expected = 2;
-        else if ((c & 0xF0) == 0xE0) expected = 3;
-        else if ((c & 0xF8) == 0xF0) expected = 4;
-        if (expected > 1) {
-            // We have only 1 byte of a multi-byte sequence — drop it.
-            --n;
+    if (n > cap - 1) {
+        n = cap - 1;
+        // We truncated. Only fix up the cut when it lands in the MIDDLE of a
+        // multi-byte codepoint — i.e. the first DROPPED byte (s[n]) is a UTF-8
+        // continuation byte (10xxxxxx). Then walk back over that codepoint's
+        // bytes and drop it whole, so the decoder never sees a dangling
+        // partial sequence. When the cut already sits on a codepoint boundary
+        // (s[n] is ASCII or a lead byte) we keep everything as-is.
+        //
+        // The previous version ran this fix-up UNCONDITIONALLY, so a string
+        // that fit completely but ended in a non-ASCII character (e.g. "Café")
+        // had its last codepoint stripped ("Caf"). Keying off the dropped byte
+        // — and only when truncation happened — avoids that.
+        if ((static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) {
+            while (n > 0 &&
+                   (static_cast<unsigned char>(s[n - 1]) & 0xC0) == 0x80)
+                --n;                       // back over continuation bytes
+            if (n > 0 && static_cast<unsigned char>(s[n - 1]) >= 0xC0)
+                --n;                       // drop the now-orphaned lead byte
         }
     }
     std::memcpy(dst, s.data(), static_cast<size_t>(n));
@@ -121,28 +119,92 @@ ScanMode modeFromInt(int v) {
     }
 }
 
+// v1.3.4 — Gateway-first reordering for multi-/24 ranges.
+// v1.3.6 — extended into a four-tier scheme. The reorder here arranges the
+//          STATIC portion (tiers 1 + 2 — always scanned first, in order); the
+//          DYNAMIC portion (tiers 4 + 3) is handled at scan time by the
+//          PriorityWorkQueue in NetworkScanner, which promotes a /24 to the
+//          front the moment any host in it responds. Execution order:
+//
+//   Tier 1: the local /24 (every host of the subnet the OS gateway is in).
+//           Skipped when no gateway IP is provided.
+//   Tier 2: scout candidates (.1 / .254 / .255) of every OTHER /24 — a fast
+//           "is anything alive here?" probe across all sibling subnets.
+//   Tier 4: (dynamic) the rest of any /24 whose tier-2 scout responded —
+//           promoted ahead of the dead subnets as soon as the scout answers.
+//   Tier 3: (dynamic) everything else — the long tail of silent subnets.
+//
+// This function lays out [tier1 | tier2 | rest] and returns the size of the
+// (tier1 + tier2) prefix. That prefix becomes ScanOptions::priorityCount, the
+// split point the work queue uses to separate "dispatch immediately, in
+// order" from "dispatch by hotness". Single-/24 ranges return 0 (no tiering —
+// the natural .1 → .254 order is already ideal and the cheap atomic path runs).
+size_t prioritizeGatewayCandidates(std::vector<uint32_t>& addresses,
+                                   uint32_t localGatewayHostOrder = 0) {
+    if (addresses.size() < 2) return 0;
+
+    // Count distinct /24 subnets (top 24 bits).
+    std::vector<uint32_t> subnets;
+    subnets.reserve(addresses.size());
+    for (uint32_t ip : addresses) subnets.push_back(ip & 0xFFFFFF00u);
+    std::sort(subnets.begin(), subnets.end());
+    subnets.erase(std::unique(subnets.begin(), subnets.end()), subnets.end());
+    if (subnets.size() < 2) return 0;   // single /24 — natural order is fine
+
+    const uint32_t localSubnet24 = localGatewayHostOrder & 0xFFFFFF00u;
+    const bool hasLocalSubnet = (localGatewayHostOrder != 0)
+        && std::binary_search(subnets.begin(), subnets.end(), localSubnet24);
+
+    // Tier 1 is anything in the local /24. Tier 2 is scouts (.1 / .254 / .255)
+    // outside the local /24. Everything else is the dynamic remainder.
+    auto isTier1 = [&](uint32_t ip) {
+        return hasLocalSubnet && (ip & 0xFFFFFF00u) == localSubnet24;
+    };
+    auto isScout = [&](uint32_t ip) {
+        if (hasLocalSubnet && (ip & 0xFFFFFF00u) == localSubnet24) return false;
+        const uint32_t lastOctet = ip & 0xFFu;
+        return lastOctet == 1u || lastOctet == 254u || lastOctet == 255u;
+    };
+    auto isPriority = [&](uint32_t ip) { return isTier1(ip) || isScout(ip); };
+
+    // Two passes of stable_partition give us [tier1 | tier2 | rest]. Each
+    // partition preserves the input order, which is ascending IP — so within
+    // the local /24 we still scan .1 first (gateway), then .2, .3, etc.,
+    // and the remainder stays sorted (so the queue can group it by /24).
+    auto t1End = std::stable_partition(addresses.begin(), addresses.end(), isTier1);
+    auto t2End = std::stable_partition(t1End, addresses.end(), isScout);
+    return static_cast<size_t>(std::distance(addresses.begin(), t2End));
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
 // Global init / shutdown.
 // ---------------------------------------------------------------------------
 
-static std::atomic<int>  g_initCount{0};
+// Serialise init/shutdown so the ref-count and WSAStartup/WSACleanup pairing
+// are atomic as a unit. A bare atomic counter has a TOCTOU window — a second
+// nl_init() could observe count>0 and return "ready" before the first
+// WSAStartup() actually completed — and lets nl_shutdown() underflow below
+// zero if called more times than nl_init(). This is a public C ABI, so make
+// it correct for concurrent callers, not just the single-threaded UI.
+static std::mutex g_initMu;
+static int        g_initCount = 0;
 
 extern "C" int nl_init(void) {
-    if (g_initCount.fetch_add(1) == 0) {
+    std::lock_guard<std::mutex> lk(g_initMu);
+    if (g_initCount == 0) {
         WSADATA wsa{};
         int rc = ::WSAStartup(MAKEWORD(2, 2), &wsa);
-        if (rc != 0) {
-            g_initCount.fetch_sub(1);
-            return rc;
-        }
+        if (rc != 0) return rc;        // stay at 0 — not initialised
     }
+    ++g_initCount;
     return 0;
 }
 
 extern "C" void nl_shutdown(void) {
-    if (g_initCount.fetch_sub(1) == 1) {
+    std::lock_guard<std::mutex> lk(g_initMu);
+    if (g_initCount > 0 && --g_initCount == 0) {
         ::WSACleanup();
     }
 }
@@ -175,6 +237,11 @@ struct nl_scanner {
     // `nl_scanner_destroy` while a scan is still running. (Audit M5.18.)
     std::mutex                      mu;
     std::vector<ScanResult>         results;            // grows live during scan
+    // IP -> index into `results`, kept in lockstep so the per-emit upsert is
+    // O(1) instead of O(N). The engine fires onHost ~4-6x per online host, so
+    // a linear scan was O(N^2) under `mu` on large ranges. Cleared/rebuilt
+    // wherever `results` is cleared or wholesale-replaced.
+    std::unordered_map<std::wstring, size_t> ipIndex;
     std::atomic<int>                done{0};
     std::atomic<int>                total{0};
     std::atomic<bool>               running{false};
@@ -210,7 +277,24 @@ extern "C" int nl_scanner_start(nl_scanner_t* s, const char* range,
     auto parsed = IpRangeParser::parse(utf8ToW(range), /*allowLarge=*/true);
     if (!parsed.ok || parsed.addresses.empty()) return -3;
 
+    // v1.3.4 — For multi-/24 ranges, hoist typical gateway IPs (.1 / .254 /
+    // .255) to the front of the work queue. v1.3.6 — additionally hoist the
+    // entire /24 containing the OS's default gateway to the very front, so
+    // the local LAN is scanned super-fast before any unrelated /24 in a
+    // /20+ range. The returned prefix length feeds ScanOptions::priorityCount,
+    // which switches executeScanLoop to the dynamic priority queue (responsive
+    // sibling /24s jump ahead of dead ones). 0 = single-/24, no tiering.
+    uint32_t gwHostOrder = 0;
+    if (opts && opts->gateway_ip && opts->gateway_ip[0]) {
+        if (auto parsedGw = ip::parseDotted(utf8ToW(opts->gateway_ip))) {
+            gwHostOrder = *parsedGw;
+        }
+    }
+    const size_t priorityCount =
+        prioritizeGatewayCandidates(parsed.addresses, gwHostOrder);
+
     ScanOptions sop;
+    sop.priorityCount    = priorityCount;
     sop.rangeText        = utf8ToW(range);
     sop.timeoutMs        = (opts && opts->timeout_ms       > 0) ? opts->timeout_ms       : kDefaultTimeoutMs;
     sop.parallel         = (opts && opts->parallel        > 0) ? opts->parallel         : kDefaultParallel;
@@ -243,6 +327,7 @@ extern "C" int nl_scanner_start(nl_scanner_t* s, const char* range,
     {
         std::lock_guard<std::mutex> lk(s->mu);
         s->results.clear();
+        s->ipIndex.clear();
     }
     s->done.store(0);
     s->total.store(static_cast<int>(parsed.addresses.size()));
@@ -250,6 +335,7 @@ extern "C" int nl_scanner_start(nl_scanner_t* s, const char* range,
     s->scan_started  = std::chrono::steady_clock::now();
     s->scan_finished = {};
 
+    try {
     s->engine.start(
         parsed.addresses, sop,
         // onHost — upserts by IP. The engine fires this callback multiple
@@ -266,13 +352,14 @@ extern "C" int nl_scanner_start(nl_scanner_t* s, const char* range,
             ScanResult enriched = r;
             EnrichmentEngine::finalize(enriched);
             std::lock_guard<std::mutex> lk(s->mu);
-            for (auto& existing : s->results) {
-                if (existing.ipAddress == enriched.ipAddress) {
-                    existing = enriched;
-                    return;
-                }
+            const std::wstring ip = enriched.ipAddress;   // key before move
+            auto it = s->ipIndex.find(ip);
+            if (it != s->ipIndex.end()) {
+                s->results[it->second] = std::move(enriched);
+            } else {
+                s->ipIndex.emplace(ip, s->results.size());
+                s->results.push_back(std::move(enriched));
             }
-            s->results.push_back(std::move(enriched));
         },
         // onProgress — done/total counter.
         [s](int done, int total) {
@@ -286,9 +373,19 @@ extern "C" int nl_scanner_start(nl_scanner_t* s, const char* range,
             // Replace the live results with the final summary list so the
             // ordering matches the canonical scan output.
             s->results = finalResults;
+            s->ipIndex.clear();   // upsert map not needed once results are final
             s->scan_finished = std::chrono::steady_clock::now();
             s->running.store(false);
         });
+    } catch (...) {
+        // Engine refused/aborted the start (e.g. OS thread-creation failure).
+        // Don't let a C++ exception cross the C ABI, and don't leave the
+        // scanner wedged in the "busy" state. NetworkScanner::start also
+        // self-heals (clears running_ + fires onFinished), so this is the
+        // belt-and-suspenders ABI guard.
+        s->running.store(false);
+        return -4;
+    }
 
     return 0;
 }
@@ -355,6 +452,7 @@ extern "C" void nl_scanner_clear_results(nl_scanner_t* s) {
 
     std::lock_guard<std::mutex> lk(s->mu);
     s->results.clear();
+    s->ipIndex.clear();
     s->done.store(0);
     s->total.store(0);
     s->scan_started  = {};
@@ -438,6 +536,9 @@ extern "C" int nl_scanner_get_result(nl_scanner_t* s, int index, nl_result_t* ou
     copyUtf8(out->printer_serial,      sizeof(out->printer_serial),      r.printerSerial);
     copyUtf8(out->printer_snmp_status, sizeof(out->printer_snmp_status), r.printerSnmpStatus);
     copyUtf8(out->printer_supplies,    sizeof(out->printer_supplies),    r.printerSupplies);
+    copyUtf8(out->printer_pages,       sizeof(out->printer_pages),       r.printerPages);
+    copyUtf8(out->smb_shares,          sizeof(out->smb_shares),          r.smbShares);
+    copyUtf8(out->iot_fingerprint,     sizeof(out->iot_fingerprint),     r.iotFingerprint);
 
     out->is_online       = r.isOnline ? 1 : 0;
     out->risk_level      = riskToInt(r.riskLevel);
@@ -447,6 +548,8 @@ extern "C" int nl_scanner_get_result(nl_scanner_t* s, int index, nl_result_t* ou
     out->service_count   = static_cast<int32_t>(r.fingerprints.size());
     out->clock_responded = r.clockDrift.responded ? 1 : 0;
     out->clock_offset_ms = r.clockDrift.offsetMs;
+    copyUtf8(out->security_findings, sizeof(out->security_findings),
+             r.securityFindings);
     return 0;
 }
 
@@ -514,10 +617,22 @@ extern "C" int nl_scanner_format_report(nl_scanner_t* s, int index,
 
     std::string utf8 = wToUtf8(w);
     int n = static_cast<int>(utf8.size());
-    int copy = n < (cap - 1) ? n : (cap - 1);
+    int copy = n;
+    if (copy > cap - 1) {
+        copy = cap - 1;
+        // Don't cut mid-codepoint (same rule as copyUtf8): if the first dropped
+        // byte is a UTF-8 continuation byte, drop the whole partial codepoint.
+        if ((static_cast<unsigned char>(utf8[copy]) & 0xC0) == 0x80) {
+            while (copy > 0 &&
+                   (static_cast<unsigned char>(utf8[copy - 1]) & 0xC0) == 0x80)
+                --copy;
+            if (copy > 0 && static_cast<unsigned char>(utf8[copy - 1]) >= 0xC0)
+                --copy;
+        }
+    }
     std::memcpy(out, utf8.data(), static_cast<size_t>(copy));
     out[copy] = '\0';
-    return n;
+    return n;   // full length so the caller can detect truncation / resize
 }
 
 extern "C" int nl_scanner_port_count(nl_scanner_t* s, int index) {

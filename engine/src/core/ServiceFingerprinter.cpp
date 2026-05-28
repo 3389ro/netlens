@@ -1097,6 +1097,15 @@ struct ServerInfoCall {
     std::wstring            name;        // SMB/NetBIOS computer name
 };
 
+// Shared state for the bounded NetShareEnum call — same abandon-safe pattern.
+struct SharesCall {
+    std::mutex                mu;
+    std::condition_variable   cv;
+    bool                      done = false;
+    bool                      ok   = false;
+    std::vector<std::wstring> shares;     // each "netname\ttype\tremark"
+};
+
 // =============================================================================
 // Minimal DNS / mDNS helpers — used by the Apple device-class probe to issue
 // a unicast PTR query for `_services._dns-sd._udp.local` on UDP 5353 and parse
@@ -1466,10 +1475,12 @@ std::vector<ServiceFingerprint> ServiceFingerprinter::fingerprintTcpServices(
         try {
             switch (p.port) {
                 case 80: case 8080: case 8000: case 8888:
+                case 9191: case 9195:   // PaperCut NG/MF admin (HTTP)
                     if (options.enableHttp)
                         push(fingerprintHttp(ipHost, ip, p.port, timeout));
                     break;
                 case 443: case 8443:
+                case 9192:              // PaperCut NG/MF admin (HTTPS)
                     if (options.enableTls)
                         push(fingerprintHttps(ip, p.port, timeout));
                     break;
@@ -1693,6 +1704,20 @@ ClockDriftInfo ServiceFingerprinter::queryNtpClock(const std::wstring& ip,
     return info;
 }
 
+// v1.5.11 — global cap on abandonable SMB/RPC worker threads. NetRemoteTOD /
+// NetServerGetInfo / NetShareEnum have no timeout parameter, so each runs on a
+// thread we abandon (detach) when it overruns. On a big scan with many hosts
+// that have 445 open but RPC filtered / black-holed, those detached threads
+// pile up until their OS call finally returns (tens of seconds). Bound the
+// in-flight total the same way DnsResolver bounds reverse-DNS: past the cap,
+// skip the probe rather than spawn unbounded threads. The slot is released by
+// the worker itself (RAII) when the OS call actually returns — so a detached,
+// still-stuck thread keeps holding its slot, which is exactly what we want.
+namespace {
+std::atomic<int>  g_rpcWorkersInFlight{0};
+constexpr int     kMaxRpcWorkers = 48;
+}  // namespace
+
 ClockDriftInfo ServiceFingerprinter::queryWindowsTimeOfDay(const std::wstring& ip,
                                                           int timeoutMs)
 {
@@ -1707,7 +1732,14 @@ ClockDriftInfo ServiceFingerprinter::queryWindowsTimeOfDay(const std::wstring& i
     auto state = std::make_shared<TodCall>();
     const std::wstring server = L"\\\\" + ip;
 
-    std::thread worker([state, server]() {
+    if (g_rpcWorkersInFlight.fetch_add(1, std::memory_order_acq_rel) >= kMaxRpcWorkers) {
+        g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        return info;                   // RPC-worker budget exhausted — skip
+    }
+    std::thread worker;
+    try {
+    worker = std::thread([state, server]() {
+        struct Rel { ~Rel(){ g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel); } } rel;
         int64_t        t1  = unixMsNow();
         LPBYTE         buf = nullptr;
         NET_API_STATUS rc  = ::NetRemoteTOD(server.c_str(), &buf);
@@ -1734,6 +1766,10 @@ ClockDriftInfo ServiceFingerprinter::queryWindowsTimeOfDay(const std::wstring& i
         }
         state->cv.notify_one();
     });
+    } catch (...) {
+        g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        return info;                   // thread didn't start — release slot
+    }
 
     bool finished = false;
     {
@@ -1772,7 +1808,14 @@ ServiceFingerprinter::queryWindowsServerInfo(const std::wstring& ip, int timeout
     auto state = std::make_shared<ServerInfoCall>();
     const std::wstring server = L"\\\\" + ip;
 
-    std::thread worker([state, server]() {
+    if (g_rpcWorkersInFlight.fetch_add(1, std::memory_order_acq_rel) >= kMaxRpcWorkers) {
+        g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        return result;                 // RPC-worker budget exhausted — skip
+    }
+    std::thread worker;
+    try {
+    worker = std::thread([state, server]() {
+        struct Rel { ~Rel(){ g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel); } } rel;
         LPBYTE buf = nullptr;
         NET_API_STATUS rc = ::NetServerGetInfo(
             const_cast<LPWSTR>(server.c_str()), 101, &buf);
@@ -1801,6 +1844,10 @@ ServiceFingerprinter::queryWindowsServerInfo(const std::wstring& ip, int timeout
         }
         state->cv.notify_one();
     });
+    } catch (...) {
+        g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        return result;                 // thread didn't start — release slot
+    }
 
     bool finished = false;
     {
@@ -1834,12 +1881,653 @@ ServiceFingerprinter::queryWindowsServerInfo(const std::wstring& ip, int timeout
     return result;
 }
 
+std::vector<std::wstring>
+ServiceFingerprinter::queryShares(const std::wstring& ip, int timeoutMs)
+{
+    std::vector<std::wstring> out;
+    auto ipHostOpt = ip::parseDotted(ip);
+    if (!ipHostOpt) return out;
+    const int timeout = clampTimeout(timeoutMs);
+
+    auto state = std::make_shared<SharesCall>();
+    const std::wstring server = L"\\\\" + ip;
+
+    if (g_rpcWorkersInFlight.fetch_add(1, std::memory_order_acq_rel) >= kMaxRpcWorkers) {
+        g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        return out;                    // RPC-worker budget exhausted — skip
+    }
+    std::thread worker;
+    try {
+    worker = std::thread([state, server]() {
+        struct Rel { ~Rel(){ g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel); } } rel;
+        PSHARE_INFO_1 buf = nullptr;
+        DWORD entriesRead = 0, totalEntries = 0, resume = 0;
+        // Level 1 = SHARE_INFO_1 (netname + type + remark). Anonymous /
+        // null-session enumeration — no credentials supplied.
+        NET_API_STATUS rc = ::NetShareEnum(
+            const_cast<LPWSTR>(server.c_str()), 1,
+            reinterpret_cast<LPBYTE*>(&buf),
+            MAX_PREFERRED_LENGTH, &entriesRead, &totalEntries, &resume);
+
+        std::vector<std::wstring> shares;
+        bool ok = false;
+        if ((rc == NERR_Success || rc == ERROR_MORE_DATA) && buf) {
+            ok = true;
+            for (DWORD i = 0; i < entriesRead; ++i) {
+                const SHARE_INFO_1& s = buf[i];
+                if (!s.shi1_netname) continue;
+                const DWORD base = s.shi1_type & 0xFFu;   // low bits = base type
+                if (base == STYPE_IPC) continue;          // skip the IPC$ pipe
+                std::wstring typeLbl =
+                      (base == STYPE_PRINTQ) ? L"Printer"
+                    : (base == STYPE_DEVICE) ? L"Device"
+                    :                          L"Disk";
+                if (s.shi1_type & STYPE_SPECIAL) typeLbl += L" (hidden)";
+                std::wstring name   = s.shi1_netname;
+                std::wstring remark = s.shi1_remark ? s.shi1_remark : L"";
+                // Keep the blob clean: drop tabs/newlines from free text.
+                for (auto& c : remark) if (c == L'\t' || c == L'\r' || c == L'\n') c = L' ';
+                shares.push_back(name + L"\t" + typeLbl + L"\t" + remark);
+            }
+        }
+        if (buf) ::NetApiBufferFree(buf);
+        {
+            std::lock_guard<std::mutex> lk(state->mu);
+            state->ok     = ok;
+            state->shares = std::move(shares);
+            state->done   = true;
+        }
+        state->cv.notify_one();
+    });
+    } catch (...) {
+        g_rpcWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        return out;                    // thread didn't start — release slot
+    }
+
+    bool finished = false;
+    {
+        std::unique_lock<std::mutex> lk(state->mu);
+        finished = state->cv.wait_for(lk, std::chrono::milliseconds(timeout),
+                                      [&] { return state->done; });
+        if (finished && state->ok) out = std::move(state->shares);
+    }
+    if (finished) worker.join();
+    else          worker.detach();
+    return out;
+}
+
+ServiceFingerprinter::MiioHello
+ServiceFingerprinter::queryMiioHello(const std::wstring& ip, int timeoutMs)
+{
+    MiioHello h;
+    auto ipHostOpt = ip::parseDotted(ip);
+    if (!ipHostOpt) return h;
+    // miIO hello is also a single lossy UDP datagram — give it a generous wait
+    // and retry, so an old/responsive Xiaomi device isn't missed on a dropped
+    // packet. (Newer Roborock won't answer at all; the retries cost little.)
+    const int perTry = (std::max)(clampTimeout(timeoutMs), 900);
+
+    // 32-byte miIO "hello": magic 0x2131, length 0x0020, then 28 bytes 0xFF
+    // (unknown + device-id + stamp + checksum placeholders).
+    unsigned char hello[32];
+    hello[0] = 0x21; hello[1] = 0x31; hello[2] = 0x00; hello[3] = 0x20;
+    for (int i = 4; i < 32; ++i) hello[i] = 0xFF;
+
+    char resp[64];
+    int n = 0;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        n = udpQuery(*ipHostOpt, 54321,
+                     reinterpret_cast<const char*>(hello), 32,
+                     resp, sizeof(resp), perTry);
+        if (n >= 32 && static_cast<unsigned char>(resp[0]) == 0x21
+                    && static_cast<unsigned char>(resp[1]) == 0x31)
+            break;
+        n = 0;
+    }
+    if (n < 32) return h;
+
+    const unsigned char* r = reinterpret_cast<const unsigned char*>(resp);
+    if (r[0] != 0x21 || r[1] != 0x31) return h;   // not a miIO header
+
+    h.responded = true;
+    h.deviceId = (static_cast<uint32_t>(r[8])  << 24)
+               | (static_cast<uint32_t>(r[9])  << 16)
+               | (static_cast<uint32_t>(r[10]) << 8)
+               |  static_cast<uint32_t>(r[11]);
+    h.stamp    = (static_cast<uint32_t>(r[12]) << 24)
+               | (static_cast<uint32_t>(r[13]) << 16)
+               | (static_cast<uint32_t>(r[14]) << 8)
+               |  static_cast<uint32_t>(r[15]);
+
+    bool allFF = true, allZero = true;
+    for (int i = 16; i < 32; ++i) {
+        if (r[i] != 0xFF) allFF   = false;
+        if (r[i] != 0x00) allZero = false;
+    }
+    h.tokenExposed = !allFF && !allZero;
+    if (h.tokenExposed) {
+        wchar_t buf[40];
+        for (int i = 0; i < 16; ++i) swprintf_s(buf + i * 2, 3, L"%02x", r[16 + i]);
+        h.tokenHex.assign(buf, 32);
+    }
+    return h;
+}
+
+namespace {
+// Map common UBNT model codes (TLV 0x0c) to friendly names. Not exhaustive —
+// unknown codes are shown verbatim.
+std::wstring ubntModelName(const std::wstring& code) {
+    struct M { const wchar_t* code; const wchar_t* name; };
+    static const M kModels[] = {
+        { L"U7PG2",  L"UniFi AP AC Pro" },
+        { L"U7LR",   L"UniFi AP AC LR" },
+        { L"U7LT",   L"UniFi AP AC Lite" },
+        { L"U7MSH",  L"UniFi AP AC Mesh" },
+        { L"U7NHD",  L"UniFi nanoHD" },
+        { L"U7HD",   L"UniFi AP HD" },
+        { L"UAP6",   L"UniFi U6" },
+        { L"U6LR",   L"UniFi U6 Long-Range" },
+        { L"U6PRO",  L"UniFi U6 Pro" },
+        { L"U6LITE", L"UniFi U6 Lite" },
+        { L"U6M",    L"UniFi U6 Mesh" },
+        { L"U6ENT",  L"UniFi U6 Enterprise" },
+        { L"U7P",    L"UniFi U7 Pro" },
+        { L"BZ2",    L"UniFi AP" },
+        { L"U2HSR",  L"UniFi AP Outdoor+" },
+        { L"US8P150",L"UniFi Switch 8 (150W)" },
+        { L"USL16P", L"UniFi Switch Lite 16 PoE" },
+        { L"USG",    L"UniFi Security Gateway" },
+        { L"UGW3",   L"UniFi Security Gateway 3P" },
+    };
+    for (const auto& m : kModels) if (code == m.code) return m.name;
+    return {};
+}
+} // namespace
+
+bool ServiceFingerprinter::looksLikeUnifiModel(const std::wstring& s) {
+    if (s.size() < 2 || s.size() > 24) return false;
+    std::wstring u;
+    u.reserve(s.size());
+    for (wchar_t c : s) {
+        if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
+        // SKU charset only — a space or other punctuation means it's a
+        // human-chosen name ("Living Room AP"), not a model code.
+        if (!((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') ||
+              c == L'-' || c == L'+'))
+            return false;
+        u.push_back(c);
+    }
+    static const wchar_t* kPrefix[] = {
+        L"U6", L"U7", L"U8", L"UAP", L"USW", L"USG", L"UDM", L"UDR",
+        L"UXG", L"UCK", L"USP", L"US-", L"UAL", L"UWB", L"UDW"
+    };
+    for (auto p : kPrefix) {
+        size_t n = 0; while (p[n]) ++n;
+        if (u.size() >= n && u.compare(0, n, p) == 0) return true;
+    }
+    return false;
+}
+
+ServiceFingerprinter::UbntInfo
+ServiceFingerprinter::queryUbntDiscovery(const std::wstring& ip, int timeoutMs)
+{
+    UbntInfo info;
+    auto ipHostOpt = ip::parseDotted(ip);
+    if (!ipHostOpt) return info;
+
+    // UBNT Discovery is a single, unacknowledged UDP datagram in each
+    // direction, so a dropped request OR reply means "no response" — which is
+    // why a one-shot probe is flaky. Mitigate with a generous per-attempt
+    // wait and a few retries, and try both the v1 and v2 request bytes (some
+    // firmware answers only one). All attempts target this one host (unicast),
+    // so per-candidate worst case is bounded (~4 × perTry) and only runs for
+    // Ubiquiti candidates.
+    const int perTry = (std::max)(clampTimeout(timeoutMs), 900);
+
+    auto parse = [&](const unsigned char* r, int n) -> bool {
+        if (n < 4) return false;
+        int i = 4;   // skip version/cmd + 2-byte payload length
+        bool gotAny = false;
+        while (i + 3 <= n) {
+            const int t   = r[i];
+            const int len = (r[i + 1] << 8) | r[i + 2];
+            i += 3;
+            if (len < 0 || i + len > n) break;
+            const unsigned char* v = r + i;
+            i += len;
+            auto asText = [&]() {
+                std::wstring s;
+                for (int k = 0; k < len; ++k) {
+                    unsigned char c = v[k];
+                    if (c >= 0x20 && c < 0x7F) s.push_back(static_cast<wchar_t>(c));
+                }
+                return s;
+            };
+            switch (t) {
+                case 0x03: info.firmware  = asText(); gotAny = true; break;
+                case 0x0b: info.hostname  = asText(); gotAny = true; break;
+                case 0x0c: info.modelCode = asText(); gotAny = true; break;
+                case 0x14: { std::wstring m = asText(); if (!m.empty()) info.modelName = m; gotAny = true; } break;
+                case 0x0a:
+                    if (len >= 4)
+                        info.uptime = (uint32_t(v[0])<<24)|(uint32_t(v[1])<<16)
+                                    | (uint32_t(v[2])<<8)|uint32_t(v[3]);
+                    break;
+                default: break;
+            }
+        }
+        return gotAny;
+    };
+
+    const unsigned char reqV1[4] = { 0x01, 0x00, 0x00, 0x00 };
+    const unsigned char reqV2[4] = { 0x02, 0x08, 0x00, 0x00 };
+    const unsigned char* reqs[4] = { reqV1, reqV1, reqV1, reqV2 };  // 3×v1, then v2
+
+    char resp[1024];
+    for (int attempt = 0; attempt < 4 && !info.responded; ++attempt) {
+        int n = udpQuery(*ipHostOpt, 10001,
+                         reinterpret_cast<const char*>(reqs[attempt]), 4,
+                         resp, sizeof(resp), perTry);
+        if (n >= 4 && parse(reinterpret_cast<const unsigned char*>(resp), n))
+            info.responded = true;
+    }
+
+    // Resolve the cleanest display model. UniFi's free-text model TLV (0x14)
+    // is unreliable — a real U6-LR has been seen to report it as
+    // "Unifi-Protect-UAP-Bridge" — so prefer, in order: a mapped marketing
+    // name from the model code; the device's self-reported hostname when it's
+    // a UniFi SKU (the default hostname IS the model, e.g. "U6-LR"); a
+    // SKU-shaped model code; and only then whatever the 0x14 TLV gave.
+    std::wstring mapped = ubntModelName(info.modelCode);
+    if (!mapped.empty())                          info.modelName = mapped;
+    else if (looksLikeUnifiModel(info.hostname))  info.modelName = info.hostname;
+    else if (looksLikeUnifiModel(info.modelCode)) info.modelName = info.modelCode;
+    // else: keep the 0x14 free-text model already parsed (may be empty).
+    return info;
+}
+
+bool ServiceFingerprinter::tcpConnectable(const std::wstring& ip, int port,
+                                          int timeoutMs) {
+    auto ipHostOpt = ip::parseDotted(ip);
+    if (!ipHostOpt) return false;
+    TcpProbe tcp;
+    return tcp.connect(*ipHostOpt, port, clampTimeout(timeoutMs));
+}
+
 std::wstring ServiceFingerprinter::localComputerName() {
     wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD len = MAX_COMPUTERNAME_LENGTH + 1;
     if (::GetComputerNameW(buf, &len))
         return std::wstring(buf, len);
     return {};
+}
+
+// --- SMB dialect probe (SMB1 + SMB2/3) ----------------------------------
+//
+// Direct protocol-level dialect detector. Independent of NetServerGetInfo
+// (which silently fails on hosts reachable only via routed paths such as
+// IPSEC site-to-site tunnels — the Windows stack bakes an NBNS broadcast
+// into its name-resolution step, and the broadcast never traverses the
+// tunnel). This probe opens a bare TCP 445 socket and exchanges raw SMB
+// negotiate frames -- no Windows session, no NetBIOS lookup -- so it
+// reaches across any TCP-routable boundary.
+//
+// Two-step probe:
+//   1) SMB2 NEGOTIATE with dialects 0x0202 .. 0x0311 + Negotiate
+//      Contexts (preauth integrity + encryption capabilities). Modern
+//      Windows hosts pick 0x0311; older boxes downgrade. Server may
+//      also reply with DialectRevision 0x02FF meaning "I do SMB1 only,
+//      ask me again with SMB1 framing" -- in which case we fall through
+//      to step 2.
+//   2) SMB1 SMB_COM_NEGOTIATE offering ten classic dialect strings
+//      (PC NETWORK PROGRAM 1.0 ... NT LM 0.12). Server responds with
+//      a 2-byte DialectIndex pointing at the offered string it picked.
+//
+// The fingerprint focuses on the SMB version itself: product=SMB,
+// version=3.1.1 / 2.0.2 / 1.0, detail describes the dialect name and
+// (parenthetically) the earliest Windows that ships it. SMB1 in
+// production is itself a finding -- the report deliberately doesn't
+// hide it behind a "Windows X" gloss.
+namespace {
+
+// Map an SMB2 dialect revision to a 3-tuple of strings:
+// version-short / dialect-long / earliest-Windows-that-shipped-it.
+struct SmbDialectInfo {
+    const wchar_t* versionShort;   // "3.1.1"
+    const wchar_t* dialectLong;    // "SMB 3.1.1"
+    const wchar_t* windowsHint;    // "Win 10 / 11 or Server 2016+"
+};
+
+const SmbDialectInfo* smb2DialectInfo(uint16_t dialect) {
+    static const SmbDialectInfo k0202{ L"2.0.2", L"SMB 2.0.2", L"Vista / Server 2008" };
+    static const SmbDialectInfo k0210{ L"2.1",   L"SMB 2.1",   L"Win 7 / Server 2008 R2" };
+    static const SmbDialectInfo k0300{ L"3.0",   L"SMB 3.0",   L"Win 8 / Server 2012" };
+    static const SmbDialectInfo k0302{ L"3.0.2", L"SMB 3.0.2", L"Win 8.1 / Server 2012 R2" };
+    static const SmbDialectInfo k0311{ L"3.1.1", L"SMB 3.1.1", L"Win 10 / 11 or Server 2016+" };
+    switch (dialect) {
+        case 0x0202: return &k0202;
+        case 0x0210: return &k0210;
+        case 0x0300: return &k0300;
+        case 0x0302: return &k0302;
+        case 0x0311: return &k0311;
+    }
+    return nullptr;
+}
+
+// SMB1 dialect strings we offer, indexed by the order we send them. The
+// server replies with a 2-byte DialectIndex pointing back into this list
+// (0xFFFF == none acceptable). NT LM 0.12 is the dialect that became
+// "SMB 1.0" colloquially; the older ones are LAN Manager era.
+struct Smb1DialectInfo {
+    const char*    offered;       // exact dialect string we send
+    const wchar_t* versionShort;  // what we report as fp.version
+    const wchar_t* dialectLong;   // detail line
+    const wchar_t* windowsHint;   // earliest Windows that shipped it
+};
+const Smb1DialectInfo kSmb1Dialects[] = {
+    { "PC NETWORK PROGRAM 1.0",  L"core",    L"SMB Core (PC NETWORK PROGRAM 1.0)", L"DOS / OS/2 era" },
+    { "MICROSOFT NETWORKS 1.03", L"1.03",    L"SMB Core+ (MICROSOFT NETWORKS 1.03)", L"DOS / OS/2 era" },
+    { "MICROSOFT NETWORKS 3.0",  L"3.0",     L"SMB DOS LANMAN 1.0 (MICROSOFT NETWORKS 3.0)", L"DOS / OS/2 era" },
+    { "LANMAN1.0",               L"1.0",     L"LAN Manager 1.0 (LANMAN1.0)",       L"OS/2 / Win NT 3.x" },
+    { "LM1.2X002",               L"1.2X002", L"LAN Manager 2.0 (LM1.2X002)",       L"OS/2 / Win NT 3.x" },
+    { "DOS LANMAN2.1",           L"2.1",     L"DOS LAN Manager 2.1",               L"OS/2 / Win NT 3.x" },
+    { "LANMAN2.1",               L"2.1",     L"LAN Manager 2.1 (LANMAN2.1)",       L"Win NT 3.x" },
+    { "NT LM 0.12",              L"1.0",     L"SMB 1.0 (NT LM 0.12)",              L"Win NT 4 / 2000 / XP / 2003" },
+};
+constexpr int kSmb1DialectCount = static_cast<int>(
+    sizeof(kSmb1Dialects) / sizeof(kSmb1Dialects[0]));
+
+// ---- Build and run an SMB2 NEGOTIATE. On success fills out `fp` and
+// returns true. Returns false if the server didn't respond, refused the
+// connection, or specifically indicated SMB1-only (the caller then falls
+// through to the SMB1 negotiate). Caller owns the TcpProbe.
+bool tryRunSmb2Negotiate(uint32_t ipHost, int timeout, ServiceFingerprint& fp) {
+    TcpProbe tcp;
+    if (!tcp.connect(ipHost, 445, timeout)) return false;
+
+    constexpr int kReq = 180;
+    unsigned char req[kReq] = {0};
+    req[0] = 0x00;
+    const int smbLen = kReq - 4;
+    req[1] = static_cast<unsigned char>((smbLen >> 16) & 0xFF);
+    req[2] = static_cast<unsigned char>((smbLen >> 8)  & 0xFF);
+    req[3] = static_cast<unsigned char>( smbLen        & 0xFF);
+    req[4] = 0xFE; req[5] = 'S'; req[6] = 'M'; req[7] = 'B';
+    req[8] = 64;                                       // SMB2 StructureSize
+    req[18] = 1;                                       // 1 credit
+    constexpr int kBody = 68;
+    req[kBody + 0] = 36;                               // body structure size
+    req[kBody + 2] = 5;                                // 5 dialects
+    req[kBody + 4] = 0x01;                             // SIGNING_ENABLED
+    req[kBody + 28] = 112;                             // NegotiateContextOffset
+    req[kBody + 32] = 2;                               // NegotiateContextCount
+    auto putLE16 = [&](int off, uint16_t v) {
+        req[off]     = static_cast<unsigned char>(v & 0xFF);
+        req[off + 1] = static_cast<unsigned char>((v >> 8) & 0xFF);
+    };
+    int kDial = 104;
+    putLE16(kDial + 0, 0x0202);
+    putLE16(kDial + 2, 0x0210);
+    putLE16(kDial + 4, 0x0300);
+    putLE16(kDial + 6, 0x0302);
+    putLE16(kDial + 8, 0x0311);
+    int kCtx1 = 116;
+    putLE16(kCtx1 + 0,  0x0001);  // PREAUTH_INTEGRITY_CAPABILITIES
+    putLE16(kCtx1 + 2,  38);
+    putLE16(kCtx1 + 8,  1);       // HashAlgorithmCount
+    putLE16(kCtx1 + 10, 32);      // SaltLength
+    putLE16(kCtx1 + 12, 0x0001);  // SHA-512
+    int kCtx2 = 168;
+    putLE16(kCtx2 + 0, 0x0002);   // ENCRYPTION_CAPABILITIES
+    putLE16(kCtx2 + 2, 4);
+    putLE16(kCtx2 + 8, 1);
+    putLE16(kCtx2 + 10, 0x0001);  // AES-128-CCM
+
+    std::string reqStr(reinterpret_cast<const char*>(req), kReq);
+    if (!tcp.sendAll(reqStr, timeout)) return false;
+
+    char rbuf[1024];
+    int total = 0;
+    ULONGLONG deadline = ::GetTickCount64() + static_cast<ULONGLONG>(timeout);
+    while (total < 80) {
+        ULONGLONG now = ::GetTickCount64();
+        if (now >= deadline) break;
+        int n = tcp.recvChunk(rbuf + total,
+                              static_cast<int>(sizeof(rbuf)) - total,
+                              static_cast<int>(deadline - now));
+        if (n <= 0) break;
+        total += n;
+    }
+    if (total < 4 + 64 + 6) return false;
+
+    const unsigned char* rb = reinterpret_cast<const unsigned char*>(rbuf);
+    if (rb[0] != 0x00) return false;
+    if (rb[4] != 0xFE || rb[5] != 'S'
+     || rb[6] != 'M'  || rb[7] != 'B') return false;
+    uint32_t status = static_cast<uint32_t>(rb[12])
+                    | (static_cast<uint32_t>(rb[13]) << 8)
+                    | (static_cast<uint32_t>(rb[14]) << 16)
+                    | (static_cast<uint32_t>(rb[15]) << 24);
+    if (status != 0) return false;
+    uint16_t dialect = static_cast<uint16_t>(rb[72])
+                     | (static_cast<uint16_t>(rb[73]) << 8);
+
+    if (dialect == 0x02FF) {
+        // Server explicitly told us "I only do SMB1" -- bail to caller
+        // so the SMB1 path runs and gives a more specific dialect.
+        return false;
+    }
+    const SmbDialectInfo* info = smb2DialectInfo(dialect);
+    if (!info) return false;
+
+    fp.port       = 445;
+    fp.protocol   = L"tcp";
+    fp.service    = L"smb";
+    fp.product    = L"SMB";
+    fp.version    = info->versionShort;
+    fp.source     = L"SMB NEGOTIATE";
+    fp.confidence = L"High";
+    fp.detail     = std::wstring(info->dialectLong)
+                  + L" -- " + info->windowsHint;
+    return true;
+}
+
+// ---- SMB1 SMB_COM_NEGOTIATE. Used only when the SMB2 path returned
+// dialect 0x02FF or when the server refused SMB2 framing outright.
+bool tryRunSmb1Negotiate(uint32_t ipHost, int timeout, ServiceFingerprint& fp) {
+    TcpProbe tcp;
+    if (!tcp.connect(ipHost, 445, timeout)) return false;
+
+    // Build the negotiate request.
+    //
+    // SMB1 header: 32 bytes.
+    //   0..3   Protocol: 0xFF 'S' 'M' 'B'
+    //   4      Command: 0x72 (SMB_COM_NEGOTIATE)
+    //   5..8   Status: 0
+    //   9      Flags: 0x18 (CANONICALIZED_PATHS | CASELESS_PATHNAMES)
+    //   10..11 Flags2: 0xC853 (UNICODE | NT_STATUS | EXTENDED_SECURITY |
+    //                          LONG_NAMES | NT_STATUS | etc -- standard
+    //                          modern client posture)
+    //   12..13 PIDHigh: 0
+    //   14..21 Signature: 0
+    //   22..23 Reserved: 0
+    //   24..25 TID: 0
+    //   26..27 PIDLow: 0xFEFF (any value)
+    //   28..29 UID: 0
+    //   30..31 MID: 1
+    // WordCount byte = 0
+    // ByteCount uint16_le = length of dialect list
+    // Dialect list: for each offered dialect, byte 0x02 then NUL-terminated string.
+    std::string body;
+    for (const auto& d : kSmb1Dialects) {
+        body.push_back('\x02');
+        body.append(d.offered);
+        body.push_back('\0');
+    }
+
+    const int hdrAndBody = 32                       // SMB header
+                         + 1                        // WordCount
+                         + 2                        // ByteCount
+                         + static_cast<int>(body.size());
+    const int total      = 4 + hdrAndBody;          // + NetBIOS frame
+    std::string req(total, '\0');
+
+    auto* p = reinterpret_cast<unsigned char*>(&req[0]);
+    // NetBIOS frame
+    p[0] = 0x00;
+    p[1] = static_cast<unsigned char>((hdrAndBody >> 16) & 0xFF);
+    p[2] = static_cast<unsigned char>((hdrAndBody >> 8)  & 0xFF);
+    p[3] = static_cast<unsigned char>( hdrAndBody        & 0xFF);
+    // SMB1 header at offset 4
+    p[4] = 0xFF; p[5] = 'S'; p[6] = 'M'; p[7] = 'B';
+    p[8] = 0x72;                                    // SMB_COM_NEGOTIATE
+    p[13] = 0x18;                                   // Flags
+    p[14] = 0x53; p[15] = 0xC8;                     // Flags2 (LE)
+    p[30] = 0xFF; p[31] = 0xFE;                     // PIDLow
+    p[34] = 0;   p[35] = 0;                         // UID
+    p[34] = 0;   p[35] = 0;
+    p[34] = 0;   p[35] = 0;                         // (defensive duplicates a no-op)
+    p[34] = 0;   p[35] = 0;
+    p[34] = 0;   p[35] = 0;
+    p[34] = 1;   p[35] = 0;                         // MID
+    // WordCount (offset 4 + 32 = 36)
+    p[36] = 0;
+    // ByteCount uint16 LE (offset 37)
+    p[37] = static_cast<unsigned char>(body.size() & 0xFF);
+    p[38] = static_cast<unsigned char>((body.size() >> 8) & 0xFF);
+    // Dialect list (offset 39)
+    memcpy(p + 39, body.data(), body.size());
+
+    if (!tcp.sendAll(req, timeout)) return false;
+
+    char rbuf[1024];
+    int read = 0;
+    ULONGLONG deadline = ::GetTickCount64() + static_cast<ULONGLONG>(timeout);
+    while (read < 50) {
+        ULONGLONG now = ::GetTickCount64();
+        if (now >= deadline) break;
+        int n = tcp.recvChunk(rbuf + read,
+                              static_cast<int>(sizeof(rbuf)) - read,
+                              static_cast<int>(deadline - now));
+        if (n <= 0) break;
+        read += n;
+    }
+    if (read < 4 + 32 + 1 + 2 + 2) return false;
+
+    const unsigned char* rb = reinterpret_cast<const unsigned char*>(rbuf);
+    if (rb[0] != 0x00) return false;
+    // Some servers reply with an SMB2 packet here even though we sent SMB1
+    // (when they pick "SMB 2.???"). Detect and bail -- SMB2 path will
+    // handle the next attempt (or has already).
+    if (rb[4] == 0xFE) return false;
+    if (rb[4] != 0xFF || rb[5] != 'S'
+     || rb[6] != 'M'  || rb[7] != 'B') return false;
+
+    // Selected DialectIndex is the first parameter word AFTER the
+    // WordCount byte at offset 4 + 32 = 36. So it lives at offset 37.
+    uint16_t idx = static_cast<uint16_t>(rb[37])
+                 | (static_cast<uint16_t>(rb[38]) << 8);
+    if (idx == 0xFFFF) return false;                // no dialect picked
+    if (idx >= static_cast<uint16_t>(kSmb1DialectCount)) return false;
+
+    const Smb1DialectInfo& info = kSmb1Dialects[idx];
+    fp.port       = 445;
+    fp.protocol   = L"tcp";
+    fp.service    = L"smb";
+    fp.product    = L"SMB";
+    fp.version    = info.versionShort;
+    fp.source     = L"SMB NEGOTIATE";
+    fp.confidence = L"High";
+    fp.detail     = std::wstring(info.dialectLong)
+                  + L" -- " + info.windowsHint;
+    return true;
+}
+
+}  // namespace
+
+ServiceFingerprint
+ServiceFingerprinter::queryWindowsSmbDialect(const std::wstring& ip,
+                                             int timeoutMs)
+{
+    ServiceFingerprint fp;
+    auto ipHostOpt = ip::parseDotted(ip);
+    if (!ipHostOpt) return fp;
+    const int timeout = clampTimeout(timeoutMs);
+
+    // SMB2 first -- the modern protocol covers 99% of live hosts. If the
+    // server only does SMB1 (Windows NT, 2000, 2003 / Samba in legacy
+    // mode) tryRunSmb2Negotiate returns false and we fall through.
+    if (tryRunSmb2Negotiate(*ipHostOpt, timeout, fp)) return fp;
+
+    // SMB1 fallback. Used for SMB1-only hosts.
+    if (tryRunSmb1Negotiate(*ipHostOpt, timeout, fp)) return fp;
+
+    return fp;   // port stays 0 on failure
+}
+
+ServiceFingerprinter::ZebraStatus
+ServiceFingerprinter::queryZebraStatus(const std::wstring& ip, int timeoutMs) {
+    ZebraStatus z;
+    auto ipHostOpt = ip::parseDotted(ip);
+    if (!ipHostOpt) return z;
+    const int timeout = clampTimeout(timeoutMs);
+
+    TcpProbe tcp;
+    if (!tcp.connect(*ipHostOpt, 9100, timeout)) return z;
+
+    // SGD getvar batch. Zebra answers each command with the value wrapped in
+    // double quotes, in request order; an unsupported var comes back as "?".
+    static const char* kReq =
+        "! U1 getvar \"appl.name\"\r\n"
+        "! U1 getvar \"device.product_name\"\r\n"
+        "! U1 getvar \"odometer.total_label_count\"\r\n"
+        "! U1 getvar \"odometer.total_print_length\"\r\n";
+    if (!tcp.sendAll(kReq, timeout)) return z;
+
+    // Drain the (small) reply. Zebra keeps 9100 open, so there's no clean
+    // close to wait for — recvUntil collects whatever lands within the
+    // timeout budget, plenty for four short quoted values.
+    std::string resp;
+    tcp.recvUntil(resp, 2048, timeout, nullptr);
+    if (resp.empty()) return z;
+
+    // Pull the quoted tokens out in order.
+    std::vector<std::string> vals;
+    size_t i = 0;
+    while (vals.size() < 8) {
+        size_t q1 = resp.find('"', i);
+        if (q1 == std::string::npos) break;
+        size_t q2 = resp.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        vals.push_back(resp.substr(q1 + 1, q2 - q1 - 1));
+        i = q2 + 1;
+    }
+    if (vals.empty()) return z;
+
+    auto field = [&](size_t idx) -> std::string {
+        if (idx >= vals.size()) return {};
+        std::string s = vals[idx];
+        if (s == "?") return {};          // var not supported on this model
+        return s;
+    };
+
+    z.responded   = true;
+    z.firmware    = sanitize(field(0), 48);
+    z.model       = sanitize(field(1), 64);
+    z.printLength = sanitize(field(3), 48);
+
+    const std::string labels = field(2);
+    if (!labels.empty()) {
+        bool numeric = true;
+        int64_t n = 0;
+        for (char c : labels) {
+            if (c < '0' || c > '9') { numeric = false; break; }
+            n = n * 10 + (c - '0');
+            if (n > 1000000000LL) { numeric = false; break; }
+        }
+        if (numeric) z.labelCount = n;
+    }
+    return z;
 }
 
 std::wstring ServiceFingerprinter::queryNbnsName(const std::wstring& ip,

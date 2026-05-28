@@ -34,6 +34,17 @@ struct PrinterInfo {
     std::wstring                  sysDescr;     // SNMP sysDescr (verbatim, truncated)
     PrinterSnmpStatus             snmpStatus = PrinterSnmpStatus::NotProbed;
     std::vector<PrinterSupply>    supplies;
+
+    // v1.4.1 — lifetime page / scan counters. -1 = unknown / not reported.
+    //   pagesTotal  : prtMarkerLifeCount (RFC 3805 standard) — total impressions
+    //                 printed over the device's life. Reliable across vendors.
+    //   pagesColor  : color impressions   — vendor-specific OID, best-effort.
+    //   pagesMono   : mono/black impressions — vendor-specific OID, best-effort.
+    //   scansTotal  : total scans (MFP)   — vendor-specific OID, best-effort.
+    int64_t                       pagesTotal = -1;
+    int64_t                       pagesColor = -1;
+    int64_t                       pagesMono  = -1;
+    int64_t                       scansTotal = -1;
 };
 
 // Single signal helper: did the engine see ANY classic printer signal on this

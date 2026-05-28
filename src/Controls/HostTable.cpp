@@ -14,6 +14,43 @@ namespace nl::HostTable {
 
 namespace {
 
+// v1.3.3 — tracks the wall-clock time of the user's most recent
+// interaction with the host listview (mouse wheel, scrollbar, click,
+// keyboard cursor). RefreshData consults it during a scan and
+// suppresses the auto-snap "make selected row visible" call when the
+// user has been actively scrolling within the last kRespectUserMs.
+// Without this, the user would see the table fight their mouse wheel
+// every snapshot — virtual ListView (LVS_OWNERDATA) loses its
+// selection state on SetItemCountEx, so the snapshot path re-asserts
+// LVIS_SELECTED+LVIS_FOCUSED, and the focused-item assertion plus an
+// explicit ListView_EnsureVisible scrolled the table back to the
+// selected row 4× per second.
+ULONGLONG s_lastUserInputMs = 0;
+constexpr ULONGLONG kRespectUserMs = 600;
+bool userIsScrolling() {
+    return (::GetTickCount64() - s_lastUserInputMs) < kRespectUserMs;
+}
+
+LRESULT CALLBACK ListSubclass(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+                              UINT_PTR /*id*/, DWORD_PTR /*ref*/) {
+    switch (msg) {
+        case WM_MOUSEWHEEL:
+        case WM_VSCROLL:
+        case WM_HSCROLL:
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_KEYDOWN:
+            // Stamp BEFORE forwarding so RefreshData fired by any
+            // resulting LVN_ITEMCHANGED sees the freshest timestamp.
+            s_lastUserInputMs = ::GetTickCount64();
+            break;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(h, ListSubclass, 1);
+            break;
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
 struct ColumnSpec {
     const wchar_t* title;
     int            widthPx96;  // unscaled
@@ -25,7 +62,8 @@ const ColumnSpec kColumns[COL_COUNT] = {
     { L"MAC",         136, LVCFMT_LEFT  },
     { L"Status",       82, LVCFMT_LEFT  },
     { L"Hostname",    160, LVCFMT_LEFT  },
-    { L"Device",      180, LVCFMT_LEFT  },
+    { L"Device Type", 180, LVCFMT_LEFT  },
+    { L"Model",       180, LVCFMT_LEFT  },
     { L"Vendor",      110, LVCFMT_LEFT  },
     { L"Open TCP ports", 170, LVCFMT_LEFT  },
     { L"Services",    260, LVCFMT_LEFT  },
@@ -339,6 +377,12 @@ HWND Create(HWND parent, HINSTANCE hInst, int id) {
         SetWindowSubclass(hHdr, HeaderSubclass, 1, 0);
     }
 
+    // v1.3.3 — subclass the listview itself so user interaction events
+    // (wheel, scroll, click, key) stamp the global last-user-input
+    // timestamp. Used by RefreshData to suppress auto-snap during
+    // active scrolling.
+    SetWindowSubclass(hLv, ListSubclass, 1, 0);
+
     UpdateSortIndicator(hLv);
     RefreshData(hLv);
     return hLv;
@@ -355,6 +399,7 @@ int ColumnToSortCol(int col) {
         case COL_STATUS:     return static_cast<int>(SC::Status);
         case COL_HOSTNAME:   return static_cast<int>(SC::Hostname);
         case COL_DEVICE:     return static_cast<int>(SC::Device);
+        case COL_MODEL:      return static_cast<int>(SC::Model);
         case COL_VENDOR:     return static_cast<int>(SC::Vendor);
         case COL_OPEN_PORTS: return static_cast<int>(SC::OpenPortCount);
         case COL_SERVICES:   return static_cast<int>(SC::Services);
@@ -371,6 +416,7 @@ int SortColToColumn(App::SortColumn sc) {
         case SC::Hostname:      return COL_HOSTNAME;
         case SC::Vendor:        return COL_VENDOR;
         case SC::Device:        return COL_DEVICE;
+        case SC::Model:         return COL_MODEL;
         case SC::OpenPortCount: return COL_OPEN_PORTS;
         case SC::Services:      return COL_SERVICES;
         case SC::Rtt:           return COL_RTT;
@@ -385,7 +431,9 @@ void OnColumnClick(HWND hLv, int column) {
     if (sc < 0) return;  // non-sortable
     App::Instance().ToggleSort(static_cast<App::SortColumn>(sc));
     UpdateSortIndicator(hLv);
-    RefreshData(hLv);
+    // User-initiated sort change must paint immediately — bypass the
+    // in-scan visible-refresh throttle inside RefreshData.
+    RefreshData(hLv, /*forceRepaint=*/true);
 }
 
 void UpdateSortIndicator(HWND hLv) {
@@ -434,13 +482,15 @@ void AutoSizeColumns(HWND hLv) {
     int wIp        = dpi::Scale(90);
     int wMac       = dpi::Scale(126);
     int wStatus    = statusVisible ? dpi::Scale(72) : 0;
-    int wHostname  = dpi::Scale(130);
-    int wDevice    = dpi::Scale(160);
+    int wHostname  = dpi::Scale(125);
+    int wDevice    = dpi::Scale(150);
+    int wModel     = dpi::Scale(160);   // exact model (printer/AP/ESXi/web title)
     int wVendor    = dpi::Scale(100);
     int wServices  = 0;       // hidden
     int wRtt       = 0;       // hidden
 
-    int fixed = wIp + wMac + wStatus + wHostname + wDevice + wVendor + wServices + wRtt;
+    int fixed = wIp + wMac + wStatus + wHostname + wDevice + wModel
+              + wVendor + wServices + wRtt;
     int wOpenPorts = avail - fixed;
     int wOpenPortsMin = dpi::Scale(150);
     if (wOpenPorts < wOpenPortsMin) wOpenPorts = wOpenPortsMin;
@@ -450,6 +500,7 @@ void AutoSizeColumns(HWND hLv) {
     ListView_SetColumnWidth(hLv, COL_STATUS,     wStatus);
     ListView_SetColumnWidth(hLv, COL_HOSTNAME,   wHostname);
     ListView_SetColumnWidth(hLv, COL_DEVICE,     wDevice);
+    ListView_SetColumnWidth(hLv, COL_MODEL,      wModel);
     ListView_SetColumnWidth(hLv, COL_VENDOR,     wVendor);
     ListView_SetColumnWidth(hLv, COL_OPEN_PORTS, wOpenPorts);
     ListView_SetColumnWidth(hLv, COL_SERVICES,   wServices);
@@ -460,7 +511,7 @@ void AutoSizeColumns(HWND hLv) {
     ListView_Scroll(hLv, -INT_MAX, 0);
 }
 
-void RefreshData(HWND hLv) {
+void RefreshData(HWND hLv, bool forceRepaint) {
     if (!hLv) return;
     const auto& idx = App::Instance().FilteredIndex();
 
@@ -471,26 +522,65 @@ void RefreshData(HWND hLv) {
     // and re-scrolling by row-pixel delta keeps the view stable.
     int topBefore = ListView_GetTopIndex(hLv);
 
-    ListView_SetItemCountEx(hLv, static_cast<int>(idx.size()), LVSICF_NOINVALIDATEALL);
-    InvalidateRect(hLv, nullptr, FALSE);
+    // The row count itself we always sync. Two flags are critical:
+    //   LVSICF_NOINVALIDATEALL — don't repaint the whole control; we
+    //                            do the throttled InvalidateRect below.
+    //   LVSICF_NOSCROLL        — don't auto-scroll the viewport.
+    //
+    // The NOSCROLL bit is the one that finally killed the "wheel scrolls
+    // then snaps back to the selected row" bug. Per MSDN: "The default
+    // behavior of the control is to scroll if needed when items are
+    // added or removed." On a scan that's 10× per second; every
+    // snapshot the listview was hauling the viewport back to wherever
+    // it thought the selection should be visible. With NOSCROLL set the
+    // count just updates and the user's wheel-set scroll position is
+    // preserved unconditionally.
+    ListView_SetItemCountEx(hLv, static_cast<int>(idx.size()),
+                            LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
 
-    int topAfter = ListView_GetTopIndex(hLv);
-    if (topAfter != topBefore && topBefore < static_cast<int>(idx.size())) {
-        // Scroll back to where the user was. Use Scroll(dx,dy) — the
-        // delta is rows × rowHeight.
-        RECT rcItem{};
-        ListView_GetItemRect(hLv, 0, &rcItem, LVIR_BOUNDS);
-        int rowH = rcItem.bottom - rcItem.top;
-        if (rowH > 0) {
-            ListView_Scroll(hLv, 0, (topBefore - topAfter) * rowH);
-        }
+    // Throttle the actual visual repaint during a scan. Snapshots land
+    // at 10 Hz; without throttling, every 100 ms the host grid would
+    // tear-down its visible row paints and immediately repaint — and
+    // when a non-default sort column (RTT, Status, Open ports) is
+    // active the live data churn keeps shuffling row order, so the
+    // user-reported effect is rows flickering and jumping every 100 ms.
+    // Cap visible refresh at ~4 Hz while the engine is mid-scan; the
+    // last snapshot pulse (isScanning=false) always paints so the final
+    // view is correct.
+    static ULONGLONG s_lastInvalidate = 0;
+    const ULONGLONG now = ::GetTickCount64();
+    const bool scanning = App::Instance().Stats().isScanning;
+    constexpr ULONGLONG kRefreshMinMs = 250;  // ~4 Hz during scan
+    bool doInvalidate = true;
+    if (!forceRepaint && scanning
+        && (now - s_lastInvalidate) < kRefreshMinMs) {
+        doInvalidate = false;
+    }
+    if (doInvalidate) {
+        s_lastInvalidate = now;
+        InvalidateRect(hLv, nullptr, FALSE);
     }
 
-    // Keep the visible selected ROW in sync with the App's IP-tracked
-    // selection. When ApplySnapshot re-resolves selectedIndex_ because
-    // the engine reshuffled the host vector at end of scan, the
-    // listview's "row N is selected" state would still point at the
-    // old row index — re-stamp the LVIS_SELECTED flag on the correct row.
+    // (v1.3.3) Removed the topBefore/topAfter scroll-restore branch.
+    // It was a safety net for SetItemCountEx clamping topIndex when
+    // the count shrinks below the previous top — but during a scan
+    // count only grows, so the branch was a no-op the 99% of the time
+    // it ran, and on the 1% (end-of-scan reshuffle / Clear / filter
+    // change) the user-reported symptom was the table snapping back to
+    // an earlier scroll position. Letting the listview handle scroll
+    // natively is the right behaviour; the worst case after a count
+    // shrink (Clear) is the view clamps to the new tail, which is
+    // self-correcting on the next user interaction. `topBefore` is no
+    // longer read after this point — kept as a local for now in case
+    // we need to bring back conditional logic.
+    (void)topBefore;
+
+    // Selection re-stamp. With LVSICF_NOSCROLL on the SetItemCountEx
+    // above, calling SetItemState here no longer drags the viewport —
+    // so we can safely keep the visible selection in sync with App's
+    // IP-tracked selectedIp_ on every snapshot. EnsureVisible /
+    // LVIS_FOCUSED are still gated on forceRepaint (user-initiated)
+    // because those genuinely DO scroll on purpose.
     int hostIdx = App::Instance().SelectedIndex();
     int desiredRow = -1;
     for (size_t i = 0; i < idx.size(); ++i) {
@@ -499,13 +589,17 @@ void RefreshData(HWND hLv) {
     int currentSel = ListView_GetNextItem(hLv, -1, LVNI_SELECTED);
     if (desiredRow != currentSel) {
         if (currentSel >= 0) {
-            ListView_SetItemState(hLv, currentSel, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_SetItemState(hLv, currentSel, 0,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
         }
         if (desiredRow >= 0) {
-            ListView_SetItemState(hLv, desiredRow,
-                                  LVIS_SELECTED | LVIS_FOCUSED,
+            UINT flags = forceRepaint ? (LVIS_SELECTED | LVIS_FOCUSED)
+                                      : LVIS_SELECTED;
+            ListView_SetItemState(hLv, desiredRow, flags,
                                   LVIS_SELECTED | LVIS_FOCUSED);
-            ListView_EnsureVisible(hLv, desiredRow, FALSE);
+            if (forceRepaint) {
+                ListView_EnsureVisible(hLv, desiredRow, FALSE);
+            }
         }
     }
 }
@@ -528,6 +622,7 @@ void OnGetDispInfo(HWND /*hLv*/, NMLVDISPINFOW* p) {
             case COL_STATUS:     p->item.pszText = const_cast<LPWSTR>(L"");          break;  // custom
             case COL_HOSTNAME:   p->item.pszText = const_cast<LPWSTR>(h.hostname.c_str()); break;
             case COL_DEVICE:     p->item.pszText = const_cast<LPWSTR>(h.deviceType.c_str()); break;
+            case COL_MODEL:      p->item.pszText = const_cast<LPWSTR>(h.deviceModel.c_str()); break;
             case COL_VENDOR:     p->item.pszText = const_cast<LPWSTR>(h.vendor.c_str()); break;
             case COL_OPEN_PORTS: p->item.pszText = const_cast<LPWSTR>(h.openPorts.c_str()); break;
             case COL_SERVICES:   p->item.pszText = const_cast<LPWSTR>(L""); break;  // custom
@@ -569,12 +664,52 @@ LRESULT OnCustomDraw(HWND hLv, NMLVCUSTOMDRAW* p) {
                 sel = (filtered[row] == selectedHostIdx);
             }
 
+            // v1.3.2 — tint the text colour of rows that have security
+            // findings, so a /24 scrolling past the operator visually
+            // surfaces the risky hosts even before they click a row.
+            // Font colour ONLY (no background fill, no row stripe) per
+            // user preference: keeps the grid calm.
+            //   Critical  → red    (red-600)
+            //   High      → orange (orange-600)
+            //   Medium    → amber  (amber-600)
+            //   Low / no findings → default TextPrimary
+            // Selection takes precedence — a selected row keeps the
+            // normal selection colour pair so red-on-light-blue
+            // doesn't read as a contrast accident.
+            COLORREF rowText = theme::Get(theme::Color::TextPrimary);
+            if (!sel && row >= 0
+                && row < static_cast<int>(filtered.size())) {
+                const HostRow& h = App::Instance().Hosts()[filtered[row]];
+                FindingSeverity worst = FindingSeverity::Low;
+                bool any = false;
+                for (const auto& f : h.findings) {
+                    if (!any || static_cast<int>(f.severity)
+                                  < static_cast<int>(worst)) {
+                        worst = f.severity;
+                    }
+                    any = true;
+                    if (worst == FindingSeverity::Critical) break;  // already at max
+                }
+                if (any) {
+                    switch (worst) {
+                        case FindingSeverity::Critical:
+                            rowText = RGB(0xDC, 0x26, 0x26); break;  // red-600
+                        case FindingSeverity::High:
+                            rowText = RGB(0xEA, 0x58, 0x0C); break;  // orange-600
+                        case FindingSeverity::Medium:
+                            rowText = RGB(0xD9, 0x77, 0x06); break;  // amber-600
+                        case FindingSeverity::Low:
+                            break;  // keep default
+                    }
+                }
+            }
+
             if (sel) {
                 p->clrTextBk = theme::Get(theme::Color::SelectionBg);
                 p->clrText   = theme::Get(theme::Color::TextPrimary);
             } else {
                 p->clrTextBk = theme::Get(theme::Color::Surface);
-                p->clrText   = theme::Get(theme::Color::TextPrimary);
+                p->clrText   = rowText;
             }
             return CDRF_NEWFONT | CDRF_NOTIFYSUBITEMDRAW;
         }

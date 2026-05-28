@@ -73,6 +73,7 @@ set(NETLENS_SOURCES
     src/Capture.cpp
     src/Theme.cpp
     src/Dpi.cpp
+    src/MockData.cpp
     src/Controls/StatCard.cpp
     src/Controls/HostTable.cpp
     src/Controls/DetailsPanel.cpp
@@ -87,6 +88,7 @@ set(NETLENS_SOURCES
     src/Theme.h
     src/Models.h
     src/Dpi.h
+    src/MockData.h
     src/Controls/StatCard.h
     src/Controls/HostTable.h
     src/Controls/DetailsPanel.h

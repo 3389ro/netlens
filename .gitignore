@@ -24,6 +24,8 @@ ipch/
 *.exp
 *.lib
 *.pch
+*.obj
+*.res
 
 # CMake
 CMakeCache.txt

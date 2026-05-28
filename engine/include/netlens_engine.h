@@ -95,7 +95,10 @@ typedef struct {
 
 void nl_scanner_get_summary(nl_scanner_t* s, nl_summary_t* out);
 
-// Clears the engine-side results buffer. Cancels any running scan first.
+// Clears the engine-side results buffer. NO-OP while a scan is running
+// (in-flight worker callbacks would otherwise re-materialise rows right after
+// the clear). Callers should cancel and wait for nl_scanner_is_running()==0
+// before clearing.
 void nl_scanner_clear_results(nl_scanner_t* s);
 
 // Writes the current results to disk. Returns 0 on success.
@@ -131,6 +134,9 @@ typedef struct {
     char     printer_serial[64];
     char     printer_snmp_status[32]; // "ok" / "unavailable" / "no supplies" / "not probed"
     char     printer_supplies[1536];  // multi-line: "<color>\t<type>\t<pct>\t<lvl>\t<max>\t<desc>"
+    char     printer_pages[96];       // v1.4.1 — "<total>\t<color>\t<mono>\t<scans>" (blank = unknown)
+    char     smb_shares[2048];        // v1.4.5 — multi-line "<netname>\t<type>\t<remark>"
+    char     iot_fingerprint[1024];   // v1.5.0 — line0 "<score>\t<label>", then evidence lines
     int32_t  is_online;           // 0/1
     int32_t  risk_level;          // 0=None 1=Low 2=Medium 3=High 4=Critical
     int32_t  response_ms;
@@ -139,6 +145,16 @@ typedef struct {
     int32_t  service_count;
     int32_t  clock_responded;     // 0/1
     int64_t  clock_offset_ms;
+    // v1.3.2 — heuristic security findings produced by SecurityAdvisor
+    // after the fingerprint pass. Multi-line; one finding per line.
+    // Line format (tab-separated): severity \t id \t title \t url
+    //   severity ∈ { "critical" | "high" | "medium" | "low" }
+    //   id       — CVE-NNNN-NNNNN or EOL-* identifier
+    //   title    — short human-readable headline
+    //   url      — reference (may be empty for EOL entries)
+    // Ordering: critical first, then high, then EOL/medium/low. Empty
+    // string when no findings matched.
+    char     security_findings[2048];
 } nl_result_t;
 
 // Copies result[index] into `out`. Returns 0 on success.

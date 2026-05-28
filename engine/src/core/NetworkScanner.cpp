@@ -10,6 +10,7 @@
 #include "PingService.h"
 #include "PortScanner.h"
 #include "RiskAnalyzer.h"
+#include "SecurityAdvisor.h"
 #include "PrinterSnmpScanner.h"
 #include "ServiceFingerprinter.h"
 #include "Stopwatch.h"
@@ -22,9 +23,13 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <deque>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ServiceDetector is still in the codebase but no longer used here — the
@@ -157,7 +162,7 @@ ScanResult scanOneHost(uint32_t hostIp,
 
     // ---- 1) ICMP ping ----
     if (!cancel.load(std::memory_order_relaxed)) {
-        auto p = PingService::ping(hostIp, opts.timeoutMs);
+        auto p = PingService::ping(hostIp, opts.timeoutMs, &cancel);
         if (p.success) {
             r.isOnline       = true;
             r.responseTimeMs = p.roundTripMs;
@@ -324,26 +329,93 @@ ScanResult scanOneHost(uint32_t hostIp,
             for (auto& b : browser) r.fingerprints.push_back(std::move(b));
         }
 
-        // Windows version via NetServerGetInfo — same anonymous-SMB surface as
-        // net time. Only when TCP 445 is open and the target isn't this host.
-        if (!cancel.load(std::memory_order_relaxed) && !isLocalHost(hostIp)) {
+        // Windows version via NetServerGetInfo + SMB NEGOTIATE dialect.
+        //
+        // The two SMB-stack probes on port 445 surface complementary
+        // information:
+        //   NetServerGetInfo  → Windows version (e.g. 10.0),
+        //                       NetBIOS computer name,
+        //                       domain-controller bit, comment.
+        //                       Works on the local LAN; fails on
+        //                       hosts reachable only via routed
+        //                       paths (IPSEC tunnel) because it
+        //                       runs an NBNS broadcast as part
+        //                       of name resolution.
+        //   SMB NEGOTIATE     → actual negotiated SMB dialect
+        //                       (1.0 .. 3.1.1). Works over any
+        //                       TCP-routable path including
+        //                       IPSEC. SMB1-only hosts are a
+        //                       finding in themselves.
+        //
+        // v1.3.6 split: SMB NEGOTIATE runs on the LOCAL machine too —
+        // a plain TCP connect to 127.0.0.1:445 works fine and gives the
+        // user their own SMB dialect (especially important when SMB1
+        // is still enabled on this box, which is a finding). Only the
+        // NetServerGetInfo half is skipped on self because its NBNS
+        // broadcast for our own IP is meaningless and slow.
+        if (!cancel.load(std::memory_order_relaxed)) {
             bool smbOpen = false;
             for (const auto& p : r.ports) {
                 if (p.isOpen && p.port == 445) { smbOpen = true; break; }
             }
             if (smbOpen) {
-                auto win = ServiceFingerprinter::queryWindowsServerInfo(
+                ServiceFingerprinter::WindowsServerInfo win{};
+                if (!isLocalHost(hostIp)) {
+                    win = ServiceFingerprinter::queryWindowsServerInfo(
+                        r.ipAddress, opts.fingerprintTimeoutMs);
+
+                    // Hostname enrichment from NetBIOS / SMB computer name.
+                    // Independent of fingerprint emission. Skip a "name"
+                    // that's just the IP address (some servers echo that).
+                    if (r.hostname.empty() && !win.computerName.empty() &&
+                        win.computerName != r.ipAddress)
+                        r.hostname = win.computerName;
+                }
+
+                auto smb = ServiceFingerprinter::queryWindowsSmbDialect(
                     r.ipAddress, opts.fingerprintTimeoutMs);
-                if (win.fingerprint.port != 0)
+                if (smb.port != 0) {
+                    // To avoid two near-duplicate 445/tcp rows in the report
+                    // (one labelled "Windows 10.0" via NetServerGetInfo and
+                    // one labelled "SMB 3.1.1" via SMB NEGOTIATE for the same
+                    // host), we merge: the SMB NEGOTIATE fingerprint is the
+                    // canonical port-445 entry, and any Windows version
+                    // NetServerGetInfo dug up gets appended to its detail.
+                    if (win.fingerprint.port != 0
+                        && !win.fingerprint.version.empty()) {
+                        smb.detail += L" -- Windows "
+                                    + win.fingerprint.version
+                                    + L" (NetServerGetInfo)";
+                    }
+                    r.fingerprints.push_back(std::move(smb));
+                } else if (win.fingerprint.port != 0) {
+                    // SMB NEGOTIATE failed (very restricted server, port
+                    // filtered mid-handshake, etc.) but NetServerGetInfo
+                    // gave us something — surface it so the report
+                    // doesn't lose the only data we got. This case is
+                    // rare; usually the inverse holds (NetServerGetInfo
+                    // fails on IPSEC, SMB NEGOTIATE succeeds).
                     r.fingerprints.push_back(std::move(win.fingerprint));
-                // Hostname fallback: reverse DNS often can't resolve a LAN host
-                // when the scanning box's upstream resolver is public (e.g.
-                // 8.8.8.8) — use the host's SMB/NetBIOS computer name instead.
-                // Skip a "name" that is just the IP address — that's noise, not
-                // a hostname.
-                if (r.hostname.empty() && !win.computerName.empty() &&
-                    win.computerName != r.ipAddress)
-                    r.hostname = win.computerName;
+                }
+
+                // v1.4.5 — enumerate exposed SMB shares (anonymous
+                // NetShareEnum, names only). NAS boxes and Samba/older
+                // servers usually allow it; modern Windows blocks anon
+                // enumeration and returns nothing. Runs on self too — the
+                // scanning host's own shares are worth auditing (and a
+                // self-connect to \\ourip\ enumerates fine).
+                if (!cancel.load(std::memory_order_relaxed)) {
+                    auto shares = ServiceFingerprinter::queryShares(
+                        r.ipAddress, opts.fingerprintTimeoutMs);
+                    if (!shares.empty()) {
+                        std::wstring blob;
+                        for (const auto& line : shares) {
+                            if (!blob.empty()) blob += L"\r\n";
+                            blob += line;
+                        }
+                        r.smbShares = std::move(blob);
+                    }
+                }
             }
         }
 
@@ -579,12 +651,296 @@ ScanResult scanOneHost(uint32_t hostIp,
                 }
                 r.printerSupplies = out;
             }
+            // v1.4.1 — lifetime page / scan counters, TAB-separated
+            //   total \t color \t mono \t scans   (blank column = unknown).
+            if (pi.pagesTotal >= 0 || pi.pagesColor >= 0
+             || pi.pagesMono >= 0 || pi.scansTotal >= 0) {
+                auto num = [](int64_t v) -> std::wstring {
+                    if (v < 0) return std::wstring{};
+                    wchar_t b[24];
+                    swprintf_s(b, L"%lld", static_cast<long long>(v));
+                    return b;
+                };
+                r.printerPages = num(pi.pagesTotal) + L"\t" + num(pi.pagesColor)
+                               + L"\t" + num(pi.pagesMono) + L"\t" + num(pi.scansTotal);
+            }
             // Promote SNMP-derived vendor/model into the host's enrichment
             // fields when they were empty — significantly better text than
             // a raw OUI vendor.
             if (!pi.vendor.empty() && r.vendor.empty()) r.vendor = pi.vendor;
             // Note: r.deviceType is left to the classifier — Printer-MIB
             // alone can mis-classify a multi-function box.
+
+            // ---- Zebra-native SGD probe over raw TCP 9100 ----------------
+            //
+            // Zebra label/barcode printers rarely populate the standard
+            // Printer-MIB the way laser/inkjet boxes do, so the SNMP path
+            // above often comes back with vendor only and no supplies/pages.
+            // Every modern Zebra answers SGD `getvar` over 9100, which works
+            // even when SNMP is disabled or locked to a non-default
+            // community. We send the bytes ONLY when the host is already
+            // confirmed Zebra (OUI vendor or SNMP sysDescr) and 9100 is open
+            // — a non-Zebra 9100 would treat the SGD text as a print job.
+            const bool zebra =
+                   (r.vendor.find(L"Zebra") != std::wstring::npos)
+                || (r.vendor.find(L"ZEBRA") != std::wstring::npos)
+                || (pi.vendor == L"Zebra")
+                || (pi.sysDescr.find(L"Zebra") != std::wstring::npos)
+                || (pi.sysDescr.find(L"ZTC")   != std::wstring::npos);
+            // NOTE: we do NOT require sig.port9100 here. Zebra GK-class
+            // printers have a tiny TCP stack that often drops 9100/515 under
+            // the parallel port sweep's short connect timeout, so the scan
+            // can miss them even when they're live (verified on a real
+            // GK420t: only 80 came back open). Since the host is already
+            // confirmed Zebra by OUI/sysDescr, it is safe to attempt a
+            // dedicated SGD connect on 9100 with the more generous
+            // fingerprint timeout — if 9100 really is closed the connect
+            // just fails fast and we move on.
+            if (zebra && opts.wantPrinterSupplies
+                && !cancel.load(std::memory_order_relaxed)) {
+                auto z = ServiceFingerprinter::queryZebraStatus(
+                    r.ipAddress, opts.fingerprintTimeoutMs);
+                if (z.responded) {
+                    r.isPrinter = true;
+                    if (r.printerVendor.empty()) r.printerVendor = L"Zebra";
+                    if (r.vendor.empty())        r.vendor        = L"Zebra";
+                    // Compose "<model> (fw <ver>)" when we have either piece.
+                    std::wstring m = z.model;
+                    if (!z.firmware.empty()) {
+                        if (!m.empty()) m += L" (fw " + z.firmware + L")";
+                        else            m  = L"Zebra (fw " + z.firmware + L")";
+                    }
+                    if (!m.empty() && m.size() > r.printerModel.size())
+                        r.printerModel = m;
+                    // Page history → reuse the printerPages plumbing, format
+                    //   "total \t color \t mono \t scans \t usage".
+                    // Newer Link-OS Zebras expose odometer.total_label_count
+                    // (→ total). GK-class printers like the GK420t return "?"
+                    // for it and only expose odometer.total_print_length, so
+                    // carry that as the free-text "usage" field — it is the
+                    // only lifetime metric the device offers and is exactly
+                    // the "page history" the operator is after.
+                    if ((z.labelCount >= 0 || !z.printLength.empty())
+                        && r.printerPages.empty()) {
+                        std::wstring total;
+                        if (z.labelCount >= 0) {
+                            wchar_t b[24];
+                            swprintf_s(b, L"%lld", static_cast<long long>(z.labelCount));
+                            total = b;
+                        }
+                        r.printerPages = total + L"\t\t\t\t" + z.printLength;
+                    }
+                    // A Zebra that answered SGD is fully readable even if its
+                    // SNMP MIB was empty — reflect that in the status.
+                    if (r.printerSnmpStatus.empty()
+                     || r.printerSnmpStatus == L"unavailable"
+                     || r.printerSnmpStatus == L"no supplies"
+                     || r.printerSnmpStatus == L"not probed") {
+                        r.printerSnmpStatus = L"ok";
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 5e.0) IoT fingerprint — Roborock / Xiaomi robot vacuums (v1.5.0) --
+    //
+    // Defensive inventory ONLY. For candidate devices (Roborock/Xiaomi MAC
+    // vendor, a robot-vacuum hostname, or the Roborock TCP 58867 port open) we
+    // run one safe, read-only probe — the Xiaomi miIO "hello" on UDP 54321 —
+    // plus passive port evidence, and compute a confidence score. No control
+    // commands, no exploit, no cloud login, no token brute force. Model and
+    // firmware are NOT read here: they require an authenticated local API
+    // (the device token), and newer Roborock devices use an encrypted TCP
+    // 58867 protocol that needs the local key. Runs only for candidates, so
+    // normal LAN scans are unaffected.
+    if (r.isOnline && !opts.skipFingerprint
+        && opts.mode != ScanMode::DiscoveryOnly
+        && !cancel.load(std::memory_order_relaxed)) {
+
+        auto lc = [](std::wstring s) {
+            for (auto& c : s) if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+            return s;
+        };
+        auto has = [&](const std::wstring& hay, const wchar_t* needle) {
+            return lc(hay).find(needle) != std::wstring::npos;
+        };
+
+        const std::wstring& v  = r.vendor;
+        const std::wstring& hn = r.hostname;
+        const std::wstring& dt = r.deviceType;
+
+        bool port58867 = false, otherIot = false;
+        for (const auto& p : r.ports) {
+            if (!p.isOpen) continue;
+            if (p.port == 58867) port58867 = true;
+            else if (p.port == 80 || p.port == 443 || p.port == 8080 || p.port == 8888)
+                otherIot = true;
+        }
+
+        const bool vendorRoboXiaomi =
+            has(v, L"roborock") || has(v, L"xiaomi") || has(v, L"lumi")
+         || has(v, L"viomi")    || has(v, L"dreame");
+        const bool hostMatch =
+            has(hn, L"roborock") || has(hn, L"rockrobo") || has(hn, L"vacuum")
+         || has(hn, L"miio")     || has(hn, L"xiaomi");
+        const bool deviceVac = has(dt, L"vacuum") || has(dt, L"robot");
+
+        // The parallel port sweep often misses 58867 on these minimal-TCP-stack
+        // devices, so for a confirmed candidate do one dedicated connect with
+        // the more generous fingerprint timeout.
+        if (!port58867 && (vendorRoboXiaomi || hostMatch || deviceVac)
+            && !cancel.load(std::memory_order_relaxed)) {
+            port58867 = ServiceFingerprinter::tcpConnectable(
+                r.ipAddress, 58867, opts.fingerprintTimeoutMs);
+        }
+
+        if (vendorRoboXiaomi || hostMatch || deviceVac || port58867) {
+            auto hello = ServiceFingerprinter::queryMiioHello(
+                r.ipAddress, opts.fingerprintTimeoutMs);
+
+            int score = 0;
+            std::vector<std::wstring> ev;
+            ev.push_back(hello.responded
+                ? L"miIO UDP 54321: responded"
+                : L"miIO UDP 54321: no response (newer Roborock uses TCP 58867)");
+            if (vendorRoboXiaomi) { score += 45; ev.push_back(L"MAC vendor in Roborock/Xiaomi family: " + v); }
+            if (hello.responded)  { score += 30; }
+            if (port58867)        { score += 25; ev.push_back(L"Roborock local-protocol port TCP 58867 open"); }
+            if (hostMatch)        { score += 10; ev.push_back(L"Hostname matches robot-vacuum pattern: " + hn); }
+            if (otherIot)         { score += 5; }
+            if (score > 100) score = 100;
+
+            if (hello.responded) {
+                wchar_t b[80];
+                swprintf_s(b, L"miIO device id: 0x%08x (stamp %u)",
+                           hello.deviceId, hello.stamp);
+                ev.push_back(b);
+                if (hello.tokenExposed)
+                    ev.push_back(L"SECURITY: device token exposed in miIO handshake "
+                                 L"(old/unprovisioned firmware): " + hello.tokenHex);
+            }
+            ev.push_back(L"Model / firmware require the device local token / "
+                         L"authenticated local API.");
+
+            const wchar_t* label =
+                  (score >= 90) ? L"Confirmed Roborock vacuum"
+                : (score >= 70) ? L"Very likely Roborock/Xiaomi vacuum"
+                : (score >= 40) ? L"Possible robot vacuum"
+                :                 L"Low-confidence IoT candidate";
+
+            if (score >= 40) {
+                wchar_t hdr[80];
+                swprintf_s(hdr, L"%d\t%s", score, label);
+                std::wstring blob = hdr;
+                for (const auto& line : ev) { blob += L"\r\n"; blob += line; }
+                r.iotFingerprint = std::move(blob);
+            }
+        }
+    }
+
+    // ---- 5e.0b) Ubiquiti / UniFi fingerprint (v1.5.1) ----
+    //
+    // Defensive inventory only. Candidate = Ubiquiti MAC vendor, a UniFi-style
+    // hostname, a dropbear SSH banner, or TCP 8080 (UniFi inform) open. Safe
+    // read-only probes: UBNT Discovery on UDP 10001 (model/firmware/hostname
+    // when the device answers — typically unadopted gear / controllers) + the
+    // existing SSH banner + an 8080 inform check. No exploit, no config change.
+    // Reuses the iotFingerprint field (a host is Roborock OR Ubiquiti, never
+    // both), so only runs when the Roborock block didn't already claim it.
+    if (r.iotFingerprint.empty() && r.isOnline && !opts.skipFingerprint
+        && opts.mode != ScanMode::DiscoveryOnly
+        && !cancel.load(std::memory_order_relaxed)) {
+
+        auto lc = [](std::wstring s) {
+            for (auto& c : s) if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+            return s;
+        };
+        auto has = [&](const std::wstring& hay, const wchar_t* needle) {
+            return lc(hay).find(needle) != std::wstring::npos;
+        };
+
+        const std::wstring& v  = r.vendor;
+        const std::wstring& hn = r.hostname;
+
+        bool port8080 = false;
+        for (const auto& p : r.ports)
+            if (p.isOpen && (p.port == 8080)) { port8080 = true; break; }
+
+        bool sshDropbear = false;
+        for (const auto& f : r.fingerprints) {
+            if (lc(f.product).find(L"dropbear") != std::wstring::npos
+             || lc(f.detail).find(L"dropbear")  != std::wstring::npos
+             || lc(f.version).find(L"dropbear") != std::wstring::npos) {
+                sshDropbear = true; break;
+            }
+        }
+
+        const bool vendorUbnt = has(v, L"ubiquiti");
+        const bool hostUbnt =
+            has(hn, L"ubnt") || has(hn, L"unifi") || has(hn, L"uap")
+         || has(hn, L"usw")  || has(hn, L"usg")   || has(hn, L"u6")
+         || has(hn, L"u7");
+
+        if (vendorUbnt || hostUbnt || sshDropbear || port8080) {
+            // 8080 can be dropped by the parallel sweep on some gear —
+            // confirm with a dedicated connect for a candidate.
+            if (!port8080 && (vendorUbnt || hostUbnt || sshDropbear)
+                && !cancel.load(std::memory_order_relaxed)) {
+                port8080 = ServiceFingerprinter::tcpConnectable(
+                    r.ipAddress, 8080, opts.fingerprintTimeoutMs);
+            }
+            auto ub = ServiceFingerprinter::queryUbntDiscovery(
+                r.ipAddress, opts.fingerprintTimeoutMs);
+
+            int score = 0;
+            std::vector<std::wstring> ev;
+            ev.push_back(ub.responded
+                ? L"UBNT Discovery UDP 10001: responded"
+                : L"UBNT Discovery UDP 10001: no response (likely controller-adopted)");
+            if (vendorUbnt)   { score += 40; ev.push_back(L"MAC vendor Ubiquiti: " + v); }
+            if (ub.responded) { score += 30; }
+            if (port8080)     { score += 20; ev.push_back(L"TCP 8080 UniFi inform endpoint"); }
+            if (sshDropbear)  { score += 15; ev.push_back(L"SSH dropbear banner (Ubiquiti firmware)"); }
+            if (hostUbnt)     { score += 10; ev.push_back(L"Hostname matches UniFi pattern: " + hn); }
+            if (score > 100) score = 100;
+
+            bool haveModel = false;
+            if (ub.responded) {
+                if (!ub.modelCode.empty()) { ev.push_back(L"Model code: " + ub.modelCode); haveModel = true; }
+                if (!ub.modelName.empty())   ev.push_back(L"Model: " + ub.modelName);
+                if (!ub.firmware.empty())    ev.push_back(L"Firmware: " + ub.firmware);
+                // Adopt the UBNT-reported hostname only when it's a genuine
+                // custom name — never when it's just the model SKU (UniFi's
+                // default hostname, e.g. "U6-LR"). The SKU is surfaced in the
+                // Model column instead, so it doesn't masquerade as a hostname.
+                if (!ub.hostname.empty() && r.hostname.empty()
+                    && !ServiceFingerprinter::looksLikeUnifiModel(ub.hostname))
+                    r.hostname = ub.hostname;
+                if (ub.uptime > 0) {
+                    wchar_t ub2[48];
+                    swprintf_s(ub2, L"Uptime: %ud %uh",
+                               ub.uptime / 86400, (ub.uptime % 86400) / 3600);
+                    ev.push_back(ub2);
+                }
+            } else {
+                ev.push_back(L"Exact model usually requires UBNT Discovery response, "
+                             L"SNMP, or authenticated SSH read-only fingerprint.");
+            }
+
+            const wchar_t* label =
+                  (score >= 90 && haveModel) ? L"Confirmed UniFi device"
+                : (score >= 70)              ? L"Confirmed Ubiquiti / likely UniFi AP"
+                : (score >= 40)              ? L"Possible Ubiquiti device"
+                :                              L"Generic network device";
+
+            if (score >= 40) {
+                wchar_t hdr[80];
+                swprintf_s(hdr, L"%d\t%s", score, label);
+                std::wstring blob = hdr;
+                for (const auto& line : ev) { blob += L"\r\n"; blob += line; }
+                r.iotFingerprint = std::move(blob);
+            }
         }
     }
 
@@ -604,6 +960,68 @@ ScanResult scanOneHost(uint32_t hostIp,
         if (hasWeb) {
             r.webUiModel = WebUiProbe::probe(r.ipAddress, openPorts,
                                               /*timeoutMs=*/1500);
+
+            // v1.5.7 — per-device-type EXACT model for the Model column.
+            // deriveExactModel handles iLO (/xmldata?item=All), Netgear
+            // (switchInfo SKU), Thecus / Yealink (title), etc., reusing the
+            // body just fetched and rejecting junk titles like "Loading...".
+            auto lower = [](std::wstring s) {
+                for (auto& c : s) if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+                return s;
+            };
+            // Authoritative for web-capable hosts: deriveExactModel is a strict
+            // per-vendor resolver (empty = "no reliable model"), so it OVERRIDES
+            // the classifier's early best-effort guess. This is what suppresses
+            // raw page titles ("Opening...", "Welcome to XAMPP", "Moved
+            // Temporarily", verbose Synology/MikroTik banners, etc.) from the
+            // Model column. Printer / ESXi / Ubiquiti models come from their own
+            // authoritative sources in EnrichmentEngine::bestDeviceModel and are
+            // unaffected by clearing r.deviceModel here.
+            r.deviceModel = WebUiProbe::deriveExactModel(
+                lower(r.deviceType), lower(r.vendor), openPorts,
+                r.webUiModel, r.ipAddress, /*timeoutMs=*/1500);
+        }
+    }
+
+    // ---- 5e.1) iLO baseboard exact model — VPN-resilient (v1.5.7) ----------
+    // An iLO answers SSH instantly but its TLS-443 handshake is slow, so over
+    // an L3 VPN the fast port sweep routinely marks 443 "closed" and the web
+    // block above never runs. Detect the iLO from its distinctive "mpSSH"
+    // (management-processor SSH) banner — or the device type / HPE vendor —
+    // then do a dedicated 443 connect with a generous timeout and read the
+    // authoritative /xmldata?item=All (PN + firmware). Only runs when 443/8443
+    // weren't already handled above, so non-VPN iLOs don't double-probe.
+    if (r.isOnline && !opts.skipFingerprint && r.deviceModel.empty()
+        && !cancel.load(std::memory_order_relaxed)) {
+        bool has443 = false, has8443 = false;
+        for (const auto& p : r.ports) {
+            if (!p.isOpen) continue;
+            if (p.port == 443)  has443  = true;
+            if (p.port == 8443) has8443 = true;
+        }
+        if (!has443 && !has8443) {
+            auto lc = [](std::wstring s) {
+                for (auto& c : s) if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+                return s;
+            };
+            bool iloLike = lc(r.deviceType).find(L"ilo") != std::wstring::npos
+                        || lc(r.vendor).find(L"hpe") != std::wstring::npos;
+            if (!iloLike) {
+                for (const auto& f : r.fingerprints) {
+                    std::wstring b = lc(f.product + L" " + f.version + L" "
+                                       + f.detail + L" " + f.source);
+                    if (b.find(L"mpssh") != std::wstring::npos
+                     || b.find(L"hp-ilo") != std::wstring::npos
+                     || b.find(L"proliant") != std::wstring::npos) {
+                        iloLike = true; break;
+                    }
+                }
+            }
+            if (iloLike
+                && ServiceFingerprinter::tcpConnectable(r.ipAddress, 443, 2500)) {
+                std::wstring m = WebUiProbe::fetchIloModel(r.ipAddress, 443, 4000);
+                if (!m.empty()) r.deviceModel = m;
+            }
         }
     }
 
@@ -623,6 +1041,13 @@ ScanResult scanOneHost(uint32_t hostIp,
     // host is local) per-port owner PID + exe path. This is what makes
     // `nl_scanner_get_result` / `nl_scanner_get_port` cheap.
     EnrichmentEngine::finalize(r);
+
+    // ---- 8) Security findings (v1.3.2) ----
+    // Heuristic CVE / lifecycle match against the now-fully-enriched
+    // fingerprint set. Reads ONLY local state, no follow-up network
+    // probe. Output is a multi-line TAB-separated string on
+    // r.securityFindings that the GUI / HTML report parses.
+    SecurityAdvisor::analyze(r);
 
     return r;
 }
@@ -682,6 +1107,97 @@ private:
 };
 
 // =============================================================================
+// PriorityWorkQueue — v1.3.6 dynamic four-tier dispatcher.
+//
+// Used only when ScanOptions::priorityCount > 0 (multi-/24 scans where the
+// caller has already laid out [tier1 local /24 | tier2 scouts | rest]). The
+// queue dispatches in this order, reacting live to host responses:
+//
+//   1. The `priorityCount` leading addresses (tier 1 + tier 2), in order.
+//   2. As soon as ANY host in a remote /24 responds, that subnet's remaining
+//      hosts are promoted to the "hot" band (tier 4) — dispatched before the
+//      still-silent subnets.
+//   3. Cold subnets (tier 3) — the long tail — dispatched last.
+//
+// Thread-safe. next() and markSubnetHot() are each one short critical section;
+// with one call per HOST (not per probe) and per-host work dominated by
+// connect()/select() timeouts, mutex contention is negligible even at 256
+// workers. The plain atomic-counter path in executeScanLoop is still used when
+// priorityCount == 0 (single-/24 or no gateway), so the cheap fast path is
+// untouched for the common case.
+class PriorityWorkQueue {
+public:
+    PriorityWorkQueue(const std::vector<uint32_t>& addrs, size_t priorityCount) {
+        const size_t n = addrs.size();
+        const size_t pc = std::min(priorityCount, n);
+        for (size_t i = 0; i < pc; ++i) priority_.push_back(addrs[i]);
+        // Group the remainder by /24, preserving ascending order within each
+        // bucket. coldOrder_ records first-seen subnet order so the long tail
+        // is dispatched in a stable, predictable sequence.
+        for (size_t i = pc; i < n; ++i) {
+            const uint32_t ip     = addrs[i];
+            const uint32_t subnet = ip & 0xFFFFFF00u;
+            auto it = buckets_.find(subnet);
+            if (it == buckets_.end()) {
+                buckets_.emplace(subnet, std::deque<uint32_t>{ip});
+                coldOrder_.push_back(subnet);
+            } else {
+                it->second.push_back(ip);
+            }
+        }
+    }
+
+    // Pop the next IP to scan, or nullopt when fully drained.
+    std::optional<uint32_t> next() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!priority_.empty()) {
+            uint32_t ip = priority_.front();
+            priority_.pop_front();
+            return ip;
+        }
+        // Hot band first (subnets whose scout already answered).
+        while (!hotOrder_.empty()) {
+            auto& dq = buckets_[hotOrder_.front()];
+            if (dq.empty()) { hotOrder_.pop_front(); continue; }
+            uint32_t ip = dq.front();
+            dq.pop_front();
+            return ip;
+        }
+        // Cold band — the long tail of silent subnets.
+        while (!coldOrder_.empty()) {
+            const uint32_t subnet = coldOrder_.front();
+            if (hot_.count(subnet)) { coldOrder_.pop_front(); continue; }
+            auto& dq = buckets_[subnet];
+            if (dq.empty()) { coldOrder_.pop_front(); continue; }
+            uint32_t ip = dq.front();
+            dq.pop_front();
+            return ip;
+        }
+        return std::nullopt;
+    }
+
+    // Promote the /24 containing `ip` into the hot band. Idempotent; no-op for
+    // the local /24 (it has no bucket — all its hosts are in priority_).
+    void markSubnetHot(uint32_t ip) {
+        const uint32_t subnet = ip & 0xFFFFFF00u;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (hot_.count(subnet)) return;
+        auto it = buckets_.find(subnet);
+        if (it == buckets_.end() || it->second.empty()) return;
+        hot_.insert(subnet);
+        hotOrder_.push_back(subnet);
+    }
+
+private:
+    std::mutex                                              mu_;
+    std::deque<uint32_t>                                    priority_;
+    std::unordered_map<uint32_t, std::deque<uint32_t>>      buckets_;
+    std::deque<uint32_t>                                    coldOrder_;
+    std::deque<uint32_t>                                    hotOrder_;
+    std::unordered_set<uint32_t>                            hot_;
+};
+
+// =============================================================================
 // executeScanLoop — the driver-thread body.
 //
 //   Spawns N std::thread workers (N = clamped parallelism), each running a
@@ -695,6 +1211,9 @@ private:
 //         onHost(result);                  // wrapped in try/catch
 //         throttle.send(...)               // throttled onProgress
 //     }
+//
+//   When ScanOptions::priorityCount > 0 the lock-free counter is replaced by
+//   a PriorityWorkQueue (see above) so responsive /24s jump the queue.
 //
 //   Once all workers join we sort results by IP, compute the summary, and
 //   fire onFinished once.
@@ -726,26 +1245,51 @@ void executeScanLoop(const std::vector<uint32_t>& addresses,
     std::atomic<int>    doneCount{0};
     ProgressThrottle    throttle;
 
+    // v1.3.6 — dynamic four-tier dispatch for multi-/24 scans. When inactive
+    // (priorityCount == 0) the queue pointer stays null and workers use the
+    // original lock-free atomic counter — zero overhead for the common case.
+    const bool useQueue = options.priorityCount > 0
+                       && options.priorityCount < total;
+    std::unique_ptr<PriorityWorkQueue> queue =
+        useQueue ? std::make_unique<PriorityWorkQueue>(addresses,
+                                                       options.priorityCount)
+                 : nullptr;
+
     auto worker = [&]() {
         for (;;) {
             if (cancelFlag.load(std::memory_order_relaxed)) return;
 
-            const size_t idx = nextIndex.fetch_add(1, std::memory_order_relaxed);
-            if (idx >= total) return;
+            uint32_t hostIp;
+            if (queue) {
+                auto ipOpt = queue->next();
+                if (!ipOpt) return;          // queue drained
+                hostIp = *ipOpt;
+            } else {
+                const size_t idx =
+                    nextIndex.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= total) return;
+                hostIp = addresses[idx];
+            }
 
             ScanResult r;
             try {
-                r = scanOneHost(addresses[idx], options, cancelFlag,
+                r = scanOneHost(hostIp, options, cancelFlag,
                                 onHost, &probesDone);
             } catch (...) {
                 // Defensive: scanOneHost is exception-free today, but if a
                 // future change ever lets one slip, mark the host as a clean
                 // offline rather than crashing the scan.
                 r = ScanResult{};
-                r.ipAddress = ip::formatDotted(addresses[idx]);
+                r.ipAddress = ip::formatDotted(hostIp);
                 r.isOnline  = false;
                 RiskAnalyzer::evaluate(r);
             }
+
+            // v1.3.6 — promote this host's /24 the moment it answers, so the
+            // rest of a live sibling subnet (tier 4) is scanned before the
+            // dead subnets (tier 3). No-op for the local /24 and for the
+            // non-queue path.
+            if (queue && r.isOnline) queue->markSubnetHot(hostIp);
 
             // Publish into the shared results vector.
             {
@@ -881,6 +1425,7 @@ void NetworkScanner::start(const std::vector<uint32_t>& addresses,
     impl_->cancel.store(false);
     probesDone_.store(0);
 
+    try {
     impl_->driver = std::make_unique<std::thread>(
         [this, addresses, options, onHost, onProgress, onFinished]() {
 
@@ -915,6 +1460,20 @@ void NetworkScanner::start(const std::vector<uint32_t>& addresses,
             }
         }
     });
+    } catch (...) {
+        // The driver thread itself couldn't be created (std::system_error /
+        // bad_alloc). The RAII guard lives INSIDE the lambda, so it never ran
+        // — running_ would stay stuck true and the exception would unwind out
+        // through the C ABI. Clear the flag so a retry is possible and notify
+        // the caller's wait-for-completion logic.
+        running_.store(false);
+        if (onFinished) {
+            ScanSummary errSummary;
+            errSummary.wasCancelled = true;
+            try { onFinished(true, errSummary, std::vector<ScanResult>{}); }
+            catch (...) {}
+        }
+    }
 }
 
 } // namespace lanscope

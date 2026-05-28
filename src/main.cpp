@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <objbase.h>
+#include <shellapi.h>  // CommandLineToArgvW for --mock
 // GDI+ needs std::min/max + PROPID before its headers. NOMINMAX is defined
 // globally so we have to bring the std versions into the gdiplus namespace
 // search scope, and <objidl.h> declares PROPID for GdiplusImaging.h.
@@ -86,6 +87,25 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE /*hPrev*/, LPWSTR /*cmd*/, int 
     nl::theme::Init(nl::dpi::g_dpi);
 
     nl::App::Instance().Init(hInst);
+
+    // --mock — feed a hard-coded 15-host fleet from MockData.cpp instead of
+    // calling the engine on Start scan. Used only to generate documentation
+    // screenshots; not advertised in the menu or About dialog. Parsed from
+    // GetCommandLineW so we don't have to wrap argv ourselves.
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            for (int i = 1; i < argc; ++i) {
+                if (lstrcmpiW(argv[i], L"--mock") == 0
+                    || lstrcmpiW(argv[i], L"/mock") == 0) {
+                    nl::App::Instance().SetMockMode(true);
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
+    }
 
     nl::StatCard::Register(hInst);
     nl::DetailsPanel::Register(hInst);

@@ -2,6 +2,7 @@
 #define NETLENS_APP_H
 
 #include <windows.h>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,6 +52,13 @@ public:
     HINSTANCE Inst() const { return inst_; }
     bool      EngineOk() const { return engineOk_; }
 
+    // `--mock` from the command line — Start scan injects a hard-coded
+    // 15-host fleet instead of calling the engine, and Export HTML writes
+    // an embedded report that mirrors the engine's output. Used only to
+    // generate screenshots for docs / the 3389.ro tool page.
+    void      SetMockMode(bool v) { mockMode_ = v; }
+    bool      IsMockMode() const  { return mockMode_; }
+
     // Live data — refreshed by RefreshFromEngine().
     const std::vector<HostRow>& Hosts() const { return hosts_; }
     const ScanStats&            Stats() const { return stats_; }
@@ -62,6 +70,9 @@ public:
     void                 SetSearch(std::wstring s);
     bool                 ViewOffline() const        { return viewOffline_; }
     void                 SetViewOffline(bool v);
+    // v1.3.3 — orthogonal severity filter for CVE / lifecycle findings.
+    SeverityFilter       MinSeverity() const        { return minSeverity_; }
+    void                 SetMinSeverity(SeverityFilter s);
 
     const std::vector<int>& FilteredIndex() const { return filteredIndex_; }
 
@@ -83,7 +94,8 @@ public:
     // Sort state (which column the host grid is sorted by + direction).
     enum class SortColumn : uint8_t {
         IpV4 = 0, Hostname, Vendor, Device, OpenPortCount, Rtt, Status, Mac,
-        Services        // sort by serviceCount
+        Services,       // sort by serviceCount
+        Model           // sort by deviceModel
     };
     SortColumn SortCol()      const { return sortCol_; }
     bool       SortAscending() const { return sortAsc_; }
@@ -126,6 +138,21 @@ public:
     // changed.
     bool ApplySnapshot(EngineSnapshot&& snap);
 
+    // Back-pressure handshake for ScanSession::runLoop. On a big scan the
+    // worker thread builds snapshots faster than the UI can apply them;
+    // without this, WM_NL_APPLY_SNAPSHOT messages pile up in the queue,
+    // each holding a heap-allocated full-host vector. The worker calls
+    // TryMarkSnapshotPending() before posting — if it returns false a
+    // previous snapshot is still in the queue, so we drop this one.
+    // ClearSnapshotPending() is called by the UI handler once it has
+    // moved the snapshot's data into App.
+    bool TryMarkSnapshotPending() {
+        return !snapshotPending_.exchange(true, std::memory_order_acq_rel);
+    }
+    void ClearSnapshotPending() {
+        snapshotPending_.store(false, std::memory_order_release);
+    }
+
     // Called from the UI thread when the scanner thread posted
     // WM_NL_SCAN_FINISHED. Handles tiered phase 1→2 transition (kicks
     // a new ScanSession for the All-Ports pass) or cleanup.
@@ -160,6 +187,7 @@ private:
     int                   selectedIndex_ = -1;
     std::wstring          selectedIp_;     // IP-tracked selection
     HostFilter            filter_        = HostFilter::All;
+    SeverityFilter        minSeverity_   = SeverityFilter::None;
     std::wstring          search_;
     bool                  viewOffline_   = false;
     std::vector<int>      filteredIndex_;
@@ -187,10 +215,17 @@ private:
     // — when phase 1 ends the session is replaced with a fresh one
     // running the All-Ports preset, and the phase-1 host snapshot is
     // merged into hosts_ during phase 2 pulls.
+    //
+    // v1.3.4 re-enabled this with a stable cross-phase ETA: the ScanSession
+    // estimator projects phase-2 cost upfront during phase 1, and adds the
+    // captured phase-1 final probe count as a baseline during phase 2.
+    // tieredPhase1Probes_ is the frozen phase-1 nl_scanner_probes_done()
+    // value captured by OnScanFinished right before clearing the engine.
     int                   tieredPhase_           = 0;
     ScanPreset            tieredOriginalPreset_  = ScanPreset::AllPortsFast;
     std::wstring          tieredRange_;
     std::vector<HostRow>  tieredPhase1Hosts_;
+    int64_t               tieredPhase1Probes_    = 0;
 
     // Cancel-vs-finish race: if the user clicks Cancel while a
     // WM_NL_SCAN_FINISHED is already queued by the worker, the dispatcher
@@ -202,6 +237,13 @@ private:
     // Single-slot cache of per-host port detail.
     int                   portsCacheHostIdx_ = -1;
     std::vector<PortRow>  portsCache_;
+
+    // `--mock` injects a hardcoded fleet from MockData.cpp instead of
+    // calling the engine. Off by default.
+    bool                  mockMode_ = false;
+
+    // See TryMarkSnapshotPending / ClearSnapshotPending above.
+    std::atomic<bool>     snapshotPending_{false};
 };
 
 }  // namespace nl

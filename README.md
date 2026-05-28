@@ -5,7 +5,7 @@ Native Windows · C++20 · Single `.exe` · No installer · No telemetry · No c
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
 [![Platform: Windows 7 → 11 x64](https://img.shields.io/badge/Platform-Windows%207%20%E2%86%92%2011%20x64-0078D6)](https://3389.ro/tools/netlens)
-[![Latest: 1.3.0](https://img.shields.io/badge/Latest-1.3.0-B4E04A)](https://github.com/3389ro/netlens/releases/latest)
+[![Latest: 1.5.13](https://img.shields.io/badge/Latest-1.5.13-B4E04A)](https://github.com/3389ro/netlens/releases/latest)
 
 Maintained by [3389 Software Outsourcing](https://3389.ro). Open source under
 the MIT License — see [`LICENSE.txt`](LICENSE.txt) for terms and
@@ -29,11 +29,20 @@ exposure hints; it never asserts a confirmed CVE on any host.
 
 ---
 
-## Highlights (1.3)
+## Highlights (1.5)
 
 - **One 2.5 MB self-contained .exe.** Native Win32 + GDI. Static CRT —
   no `vcruntime` / `msvcp` DLL dependency. PerMonitorV2 DPI awareness.
   Loads on Windows 7 / 8 / 8.1 / 10 / 11 / Server 2012+.
+- **Security findings.** Curated CVE / EOL heuristics derived from
+  observable banners, fingerprints and version hints — surfaced in the
+  details pane and the HTML report. Heuristic hints, never a confirmed CVE.
+- **Device Type + exact Model.** A dedicated Model column (grid, HTML and
+  CSV) reads the precise model only from manufacturer-driven, read-only
+  endpoints — HPE iLO, TP-Link, MikroTik RouterOS, VMware ESXi, Ubiquiti,
+  Netgear, Yealink, Synology / Thecus — and never shows a raw page title.
+- **SMB dialect + shares.** Direct SMB negotiation reports SMB 1.0 / 2.x /
+  3.x, with anonymous share enumeration where the host permits it.
 - **Live host grid.** Sortable on every column; selection follows the
   IP across mid-scan re-sorts and end-of-scan reshuffles.
 - **Eight UDP discovery probes** per online host (Full Common preset
@@ -97,7 +106,7 @@ NetLens/
 ├── NOTICE.txt
 ├── README.md
 ├── SECURITY.md
-├── VERSION                          ← single source of truth (1.3.0)
+├── VERSION                          ← single source of truth (1.5.13)
 ├── app.manifest
 ├── app.rc
 ├── build.ps1                        ← one-shot Configure + Build

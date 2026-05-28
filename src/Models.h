@@ -15,12 +15,32 @@ enum class ScanPreset      : uint8_t {
     Quick = 0, Standard, FullCommon, AllPortsFast, AllPortsDeep, CustomPorts
 };
 enum class HostFilter      : uint8_t { All = 0, OnlineOnly, HasOpenPorts };
+// v1.3.3 — orthogonal severity filter, applied on top of HostFilter.
+// "None" passes every host through; the three positive states pass
+// only hosts whose worst finding meets-or-exceeds the threshold.
+// Matches the CVE colour coding (Critical=red, High=orange,
+// Medium=amber) used in the host-grid row text and the right pane.
+enum class SeverityFilter  : uint8_t { None = 0, MediumPlus, HighPlus, CriticalOnly };
 
 enum class ServiceCategory : uint8_t { Other, Web, Remote, Shell, Share, Mgmt, Db };
 
 struct ServiceBadge {
     std::wstring     label;
     ServiceCategory  category = ServiceCategory::Other;
+};
+
+// Heuristic security finding produced by the engine's SecurityAdvisor
+// after the fingerprint pass. Either a curated CVE match (RCE or
+// credential takeover only — no DoS / info-disclosure) or an EOL /
+// lifecycle hit. Rendered in the DetailsPanel "Security findings"
+// section and in the HTML report.
+enum class FindingSeverity : uint8_t { Critical, High, Medium, Low };
+
+struct SecurityFinding {
+    FindingSeverity severity = FindingSeverity::Medium;
+    std::wstring    id;       // "CVE-2017-0144" / "EOL-SMB1"
+    std::wstring    title;    // short human-readable headline
+    std::wstring    url;      // reference URL (may be empty)
 };
 
 struct PortRow {
@@ -59,6 +79,9 @@ struct HostRow {
     std::wstring    printerSerial;
     std::wstring    printerSnmpStatus;   // "ok" / "unavailable" / "no supplies" / "not probed"
     std::wstring    printerSupplies;     // "\r\n"-lines, "\t"-cols: color/type/pct/lvl/max/desc
+    std::wstring    printerPages;        // v1.4.1 — "<total>\t<color>\t<mono>\t<scans>" (blank = unknown)
+    std::wstring    smbShares;           // v1.4.5 — "\r\n"-lines: "<netname>\t<type>\t<remark>"
+    std::wstring    iotFingerprint;      // v1.5.0 — line0 "<score>\t<label>", then evidence lines
     bool            isOnline = false;
     RiskLevel       risk = RiskLevel::None;
     int32_t         responseMs = 0;
@@ -67,6 +90,17 @@ struct HostRow {
     int32_t         serviceCount = 0;
     bool            clockResponded = false;
     int64_t         clockOffsetMs = 0;
+    // Smallest open port number on the host, parsed once at snapshot
+    // build-time so the comparator that backs the "Open TCP ports" column
+    // sort doesn't reparse the openPorts CSV on every comparison. 0 when
+    // the host has no open ports (sorts first ascending — same place as
+    // count-based sort used to put them, so the visual behaviour matches).
+    int32_t         firstOpenPort = 0;
+    // Heuristic security findings produced by the engine (v1.3.2).
+    // Parsed at snapshot apply time from `nl_result_t.security_findings`.
+    // Order is the engine's order — critical first, then high, then
+    // EOL / medium / low — the DetailsPanel renders top-down.
+    std::vector<SecurityFinding> findings;
     std::vector<ServiceBadge> badges;
     std::vector<PortRow>      ports;
 };

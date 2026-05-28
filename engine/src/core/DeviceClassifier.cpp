@@ -281,6 +281,16 @@ std::wstring extractModel(const ScanResult& r, const std::wstring& type) {
         if (t.empty()) continue;
 
         std::wstring lo = toLower(t);
+        // Normalise trailing punctuation so "Loading..." / "Login." collapse
+        // onto the bare placeholder keyword below — a switch admin SPA whose
+        // static title is "Loading..." was otherwise surfaced as the model.
+        while (!lo.empty()) {
+            wchar_t c = lo.back();
+            if (c == L'.' || c == L' ' || c == L'\x2026' || c == L'!'
+                || c == L':' || c == L'|')
+                lo.pop_back();
+            else break;
+        }
         bool generic = false;
         for (auto g : kGeneric) if (lo == g) { generic = true; break; }
         if (generic) continue;
@@ -325,6 +335,19 @@ void DeviceClassifier::classify(ScanResult& r, const std::wstring& gatewayIp) {
     // ---- T0: the default gateway ------------------------------------------
     if (!gatewayIp.empty() && r.ipAddress == gatewayIp)
         type = L"Router / Gateway";
+
+    // ---- T0.5: HPE iLO via its "mpSSH" management-processor SSH banner -----
+    // Reliable even over an L3 VPN, where there's no ARP / MAC-OUI vendor and
+    // the box would otherwise fall through to "Linux/Unix host" (SSH open).
+    if (type.empty()) {
+        for (const auto& f : r.fingerprints) {
+            std::wstring b = toLower(f.product + L" " + f.version + L" " + f.detail);
+            if (b.find(L"mpssh") != std::wstring::npos) {
+                type = L"HPE iLO baseboard";
+                break;
+            }
+        }
+    }
 
     // ---- T1: management-UI / product keywords (the device named itself) ----
     if (type.empty()) {

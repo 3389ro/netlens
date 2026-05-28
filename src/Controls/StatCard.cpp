@@ -128,31 +128,56 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Paint(hwnd);
             return 0;
 
+        // Each setter compares the new value against the cached one and
+        // only invalidates the card when the value actually changed.
+        // UpdateKpiCards() runs on every snapshot (10 Hz during a scan)
+        // and re-sends every label/value/accent every tick — without
+        // this guard we'd burn a full owner-paint cycle (offscreen DC +
+        // rectangle + 3 DrawTextW + brush/pen) per card per snapshot
+        // even when the displayed text hasn't budged. On a four-card
+        // KPI strip that's ~40 redundant card repaints/sec during a
+        // scan; with the guard, only the one or two cards whose values
+        // actually advanced (Scan Progress %, Duration) repaint.
         case WM_SC_SET_LABEL: {
             if (Data* d = GetData(hwnd)) {
-                d->label = reinterpret_cast<const wchar_t*>(lp);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                const wchar_t* s = reinterpret_cast<const wchar_t*>(lp);
+                if (!s) s = L"";
+                if (d->label != s) {
+                    d->label = s;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             }
             return 0;
         }
         case WM_SC_SET_VALUE: {
             if (Data* d = GetData(hwnd)) {
-                d->value = reinterpret_cast<const wchar_t*>(lp);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                const wchar_t* s = reinterpret_cast<const wchar_t*>(lp);
+                if (!s) s = L"";
+                if (d->value != s) {
+                    d->value = s;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             }
             return 0;
         }
         case WM_SC_SET_SECONDARY: {
             if (Data* d = GetData(hwnd)) {
-                d->secondary = reinterpret_cast<const wchar_t*>(lp);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                const wchar_t* s = reinterpret_cast<const wchar_t*>(lp);
+                if (!s) s = L"";
+                if (d->secondary != s) {
+                    d->secondary = s;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             }
             return 0;
         }
         case WM_SC_SET_ACCENT: {
             if (Data* d = GetData(hwnd)) {
-                d->accent = static_cast<COLORREF>(wp);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                COLORREF c = static_cast<COLORREF>(wp);
+                if (d->accent != c) {
+                    d->accent = c;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             }
             return 0;
         }

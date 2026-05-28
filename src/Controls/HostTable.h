@@ -16,6 +16,7 @@ enum Column : int {
     COL_STATUS,
     COL_HOSTNAME,
     COL_DEVICE,
+    COL_MODEL,
     COL_VENDOR,
     COL_OPEN_PORTS,
     COL_SERVICES,
@@ -24,7 +25,12 @@ enum Column : int {
 };
 
 HWND    Create(HWND parent, HINSTANCE hInst, int id);
-void    RefreshData(HWND hLv);
+// Sync the virtual list view's row count from App::FilteredIndex and
+// trigger a repaint. During an active scan the visible repaint is
+// throttled to ~4 Hz to keep the grid readable; `forceRepaint=true`
+// bypasses the throttle (used when the user clicks a column header
+// to re-sort — that interaction must update visibly immediately).
+void    RefreshData(HWND hLv, bool forceRepaint = false);
 void    OnGetDispInfo(HWND hLv, NMLVDISPINFOW* p);
 LRESULT OnCustomDraw(HWND hLv, NMLVCUSTOMDRAW* p);
 
@@ -38,8 +44,8 @@ void    UpdateSortIndicator(HWND hLv);
 void    SetStatusColumnVisible(HWND hLv, bool visible);
 
 // Redistribute column widths based on the listview's current client width.
-// Fixed widths for IP/MAC/Status/Hostname/Device/Vendor/OpenPorts/RTT,
-// Services flexes to fill. Call after the listview is resized.
+// Fixed widths for IP/MAC/Status/Hostname/Device/Model/Vendor/RTT,
+// Open TCP ports flexes to fill. Call after the listview is resized.
 void    AutoSizeColumns(HWND hLv);
 
 }  // namespace HostTable

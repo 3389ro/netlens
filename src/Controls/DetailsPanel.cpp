@@ -39,15 +39,36 @@ const wchar_t* const kBtnLabels[kBtnCount] = {
 enum class CopyKind : uint8_t {
     None, IP, Hostname, MAC, Vendor, OpenPorts,
     // additional copyable blocks (printer supplies + UDP discovery).
-    PrinterSupplies, UdpDiscovery
+    PrinterSupplies, UdpDiscovery,
+    // v1.3.2 — copy a finding's reference URL (CVE link or empty).
+    // The actual URL string is on CopyHit::customText since it varies
+    // per row; extending the enum per-URL would explode the surface.
+    FindingUrl,
+    // v1.3.2 — open a finding's reference URL in the default browser
+    // via ShellExecuteW. customText holds the URL.
+    FindingOpenUrl,
+    // v1.4.6 — SMB share row actions. customText holds the UNC path
+    // "\\<ip>\<share>". Open launches Explorer at it; Copy puts it on
+    // the clipboard.
+    SmbShareOpen,
+    SmbShareCopy
 };
 struct CopyHit {
-    CopyKind kind = CopyKind::None;
-    RECT     rc{};   // in client coords (paint-time, already scroll-adjusted)
+    CopyKind     kind = CopyKind::None;
+    RECT         rc{};        // in client coords (paint-time, already scroll-adjusted)
+    std::wstring customText;  // payload for CopyKind::FindingUrl (per-row URL)
 };
 
 struct State {
     int   hostIndex = -1;
+    // v1.3.3 — Track the selected host by IP, not just by index. At
+    // end-of-scan the engine reshuffles hosts_ into canonical sort
+    // order; the IP-tracked selection points at the same host but its
+    // array index moves. Without storing the IP here, the equality
+    // check in WM_DP_SET_HOST (newIdx vs old st->hostIndex) treats the
+    // reshuffle as a host change and resets scrollY — knocking the
+    // user mid-read in the right pane.
+    std::wstring  lastHostIp;
     HWND  buttons[kBtnCount] = {};
     int   scrollY        = 0;
     int   bodyTopY       = 0;     // y where the scrollable body starts (set by PaintPanel)
@@ -229,19 +250,19 @@ int DrawKeyValue(HDC hdc, int x, int y, int wKey, int wVal,
     RECT rcV = { x + wKey + dpi::Scale(10), y,
                  x + wKey + dpi::Scale(10) + wVal, y + dpi::Scale(20) };
 
-    // For multi-line values (brand hint can contain '\n'), use DT_WORDBREAK.
-    DWORD flags = DT_LEFT | DT_TOP | DT_NOPREFIX | DT_END_ELLIPSIS;
-    bool multiline = false;
-    for (const wchar_t* p = value; *p; ++p) if (*p == L'\n') { multiline = true; break; }
-    if (multiline) {
-        // Expand height to fit multiple lines (rough estimate)
-        rcV.bottom = y + dpi::Scale(80);
-        flags = DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK;
-        // Calculate actual height
-        RECT calc = rcV;
-        DrawTextW(hdc, value, -1, &calc, flags | DT_CALCRECT);
-        rcV.bottom = calc.bottom;
-    }
+    // Always word-wrap. Even single-line values can overflow the
+    // value column when the user has dragged the splitter narrow, and
+    // the previous DT_END_ELLIPSIS fallback truncated them mid-word
+    // (e.g. the CVE summary line on the Security findings rows above,
+    // or a long "VMware ESXi 6.x/7.0 -- OpenSLP heap overflow..." brand
+    // hint). DT_CALCRECT measures the wrapped height so the row
+    // advance below covers exactly the painted area — no over-tall
+    // gaps on short values, no clipping on long ones.
+    DWORD flags = DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK;
+    rcV.bottom = y + dpi::Scale(400);   // generous calc ceiling
+    RECT calc = rcV;
+    DrawTextW(hdc, value, -1, &calc, flags | DT_CALCRECT);
+    rcV.bottom = calc.bottom;
     DrawTextW(hdc, value, -1, &rcV, flags);
 
     SelectObject(hdc, oldF);
@@ -555,7 +576,8 @@ void PaintPanel(HWND hwnd) {
         kvCopy(L"Hostname",     h.hostname,    CopyKind::Hostname, !h.hostname.empty());
         kvCopy(L"MAC address",  h.mac,         CopyKind::MAC,      !h.mac.empty());
         kvCopy(L"Vendor",       h.vendor,      CopyKind::Vendor,   !h.vendor.empty());
-        kvCopy(L"Device",       h.deviceType,  CopyKind::None,     false);
+        kvCopy(L"Device Type",  h.deviceType,  CopyKind::None,     false);
+        kvCopy(L"Model",        h.deviceModel, CopyKind::None,     false);
 
         y += dpi::Scale(10);
 
@@ -604,6 +626,177 @@ void PaintPanel(HWND hwnd) {
             y = ry + chipH + dpi::Scale(14);
         }
 
+        // ---- SECURITY FINDINGS (v1.3.2) ----
+        //
+        // Placed high in the right pane — right after IDENTITY /
+        // SERVICES and ABOVE the diagnostic INFERRED / PORTS / UDP
+        // sections — because for a security-aware operator the
+        // "what's wrong with this host" answer is more important
+        // than the protocol minutiae below. Findings come from the
+        // engine's SecurityAdvisor; only RCE and credential-takeover
+        // CVEs surface, plus end-of-life lifecycle hits. The
+        // disclaimer banner above the rows reminds the user this is
+        // a banner-matching heuristic, not a configuration audit —
+        // a patched-in-place server can still match if its banner
+        // wasn't bumped.
+        //
+        // Per-finding row layout (two visible lines):
+        //   Line 1:  [SEVERITY-colored]  ID                     [⧉ url]
+        //   Line 2:  human-readable title (single-line, ellipsis)
+        if (!h.findings.empty()) {
+            wchar_t hdr[64];
+            swprintf_s(hdr, L"SECURITY FINDINGS (%zu)", h.findings.size());
+            DrawSectionHeader(memDc, { padL, y, W - padR, y + dpi::Scale(16) }, hdr);
+            y += dpi::Scale(22);
+
+            // Disclaimer banner — muted text. Word-wraps to however
+            // many lines the current panel width forces; we measure
+            // the wrapped height with DT_CALCRECT first so we don't
+            // clip on narrow panels (panel width depends on splitter
+            // position which the user drags freely).
+            HFONT df = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().regular));
+            SetTextColor(memDc, theme::Get(theme::Color::TextMuted));
+            const wchar_t* kDisclaimer =
+                L"Heuristic based on banners and protocol negotiations -- "
+                L"not a configuration audit. False positives possible if a "
+                L"host has been patched in place without updating its banner.";
+            RECT rcDiscMeas = { padL, y, W - padR, y + dpi::Scale(200) };
+            DrawTextW(memDc, kDisclaimer, -1, &rcDiscMeas,
+                      DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+            const int discH = rcDiscMeas.bottom - rcDiscMeas.top;
+            RECT rcDisc = { padL, y, W - padR, y + discH };
+            DrawTextW(memDc, kDisclaimer, -1, &rcDisc,
+                      DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+            SelectObject(memDc, df);
+            y += discH + dpi::Scale(6);
+
+            const int rowH      = dpi::Scale(20);
+            const int gap       = dpi::Scale(2);
+            const int sevW      = dpi::Scale(78);   // "[CRITICAL]"
+            const int idW       = dpi::Scale(150);  // CVE-NNNN-NNNNN
+            const int copyW     = dpi::Scale(20);
+            const int titleX    = padL + sevW;
+            const int titleR    = W - padR - copyW - dpi::Scale(4);
+
+            for (const auto& fnd : h.findings) {
+                // Severity badge (uppercase, colored — no rounded
+                // background, just colored text in brackets to match
+                // the existing IDENTITY / INFERRED visual style).
+                COLORREF sevColor;
+                const wchar_t* sevLabel;
+                switch (fnd.severity) {
+                    case FindingSeverity::Critical:
+                        sevColor = RGB(0xDC, 0x26, 0x26);     // red-600
+                        sevLabel = L"[CRITICAL]";
+                        break;
+                    case FindingSeverity::High:
+                        sevColor = RGB(0xEA, 0x58, 0x0C);     // orange-600
+                        sevLabel = L"[HIGH]";
+                        break;
+                    case FindingSeverity::Medium:
+                        sevColor = RGB(0xD9, 0x77, 0x06);     // amber-600
+                        sevLabel = L"[MEDIUM]";
+                        break;
+                    default:
+                        sevColor = RGB(0xA1, 0x62, 0x07);     // amber-700 muted
+                        sevLabel = L"[LOW]";
+                        break;
+                }
+
+                // Line 1: severity + clickable CVE-ID + copy-URL icon.
+                HFONT sf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().semibold));
+                SetTextColor(memDc, sevColor);
+                RECT rcSev = { padL, y, padL + sevW, y + rowH };
+                DrawTextW(memDc, sevLabel, -1, &rcSev,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                // Render the CVE ID as a clickable hyperlink — accent
+                // colour (blue) so the user knows it's interactive,
+                // and a hit area so left-click opens the reference
+                // URL in the default browser via ShellExecuteW. The
+                // ⧉ copy-URL glyph on the right edge still copies the
+                // URL to clipboard without leaving the app.
+                const bool hasUrl = !fnd.url.empty();
+                if (hasUrl) {
+                    SetTextColor(memDc, theme::Get(theme::Color::Accent));
+                } else {
+                    SetTextColor(memDc, theme::Get(theme::Color::TextPrimary));
+                }
+                RECT rcId = { titleX, y, titleX + idW, y + rowH };
+                DrawTextW(memDc, fnd.id.c_str(), -1, &rcId,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(memDc, sf);
+
+                // Register the CVE-ID rect as a clickable open-URL hit.
+                // Tightened to roughly the text extent so the click
+                // target is the ID text, not the empty space after it.
+                if (hasUrl) {
+                    SIZE idSz{};
+                    GetTextExtentPoint32W(memDc, fnd.id.c_str(),
+                                          static_cast<int>(fnd.id.size()), &idSz);
+                    CopyHit linkHit;
+                    linkHit.kind = CopyKind::FindingOpenUrl;
+                    linkHit.rc.left   = titleX;
+                    linkHit.rc.right  = titleX + std::min(
+                        static_cast<int>(idSz.cx) + dpi::Scale(4), idW);
+                    linkHit.rc.top    = y                + bodyDelta;
+                    linkHit.rc.bottom = y + rowH         + bodyDelta;
+                    if (linkHit.rc.top >= bodyStart && linkHit.rc.bottom <= H) {
+                        linkHit.customText = fnd.url;
+                        st->copyHits.push_back(std::move(linkHit));
+                    }
+                }
+
+                // Copy-URL affordance (only when the finding has a URL).
+                if (hasUrl) {
+                    // Small "⧉" glyph in TextMuted, clickable
+                    // rectangle. The URL travels with the hit via
+                    // customText since AddCopyAffordance's CopyKinds
+                    // are static.
+                    const int btnX = W - padR - copyW;
+                    const int btnY = y + (rowH - dpi::Scale(14)) / 2;
+                    RECT rcBtn = { btnX, btnY, btnX + copyW,
+                                   btnY + dpi::Scale(14) };
+                    HFONT cf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().regular));
+                    SetTextColor(memDc, theme::Get(theme::Color::TextMuted));
+                    DrawTextW(memDc, L"\x29c9", -1, &rcBtn,
+                              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(memDc, cf);
+                    CopyHit copyHit;
+                    copyHit.kind = CopyKind::FindingUrl;
+                    copyHit.rc.left   = rcBtn.left;
+                    copyHit.rc.top    = rcBtn.top    + bodyDelta;
+                    copyHit.rc.right  = rcBtn.right;
+                    copyHit.rc.bottom = rcBtn.bottom + bodyDelta;
+                    if (copyHit.rc.top >= bodyStart && copyHit.rc.bottom <= H) {
+                        copyHit.customText = fnd.url;
+                        st->copyHits.push_back(std::move(copyHit));
+                    }
+                }
+                y += rowH;
+
+                // Line 2: title (full description, word-wrapped so a
+                // long CVE blurb like the OpenSLP RCE summary doesn't
+                // get truncated with an ellipsis on a narrow right
+                // pane. Measured with DT_CALCRECT first so the row
+                // advances by the actual painted height — the next
+                // finding starts cleanly below however many lines this
+                // one used.
+                HFONT tf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().regular));
+                SetTextColor(memDc, theme::Get(theme::Color::TextSecondary));
+                RECT rcTmeas = { titleX, y, titleR, y + dpi::Scale(200) };
+                DrawTextW(memDc, fnd.title.c_str(), -1, &rcTmeas,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+                const int tH = std::max<int>(rowH, rcTmeas.bottom - rcTmeas.top);
+                RECT rcT = { titleX, y, titleR, y + tH };
+                DrawTextW(memDc, fnd.title.c_str(), -1, &rcT,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+                SelectObject(memDc, tf);
+                y += tH + gap;
+            }
+            y += dpi::Scale(10);
+        }
+
         // ---- Inferred ----
         if (!h.brandHint.empty() || !h.osHint.empty()
             || !h.deviceHint.empty() || !h.webUiModel.empty()) {
@@ -638,10 +831,22 @@ void PaintPanel(HWND hwnd) {
                               bodyStart, H);
             y += dpi::Scale(22);
 
-            // Slim header: only the serial number (vendor + model are
-            // already shown in IDENTITY / Device rows above). When SN
-            // isn't readable the line is skipped and we go straight to
-            // the supplies table.
+            // Model + firmware line. The IDENTITY block above shows the
+            // device CLASS ("Printer") and OUI vendor ("Zebra"), but not the
+            // specific model/firmware the SNMP Printer-MIB (or, for Zebra,
+            // the SGD probe) reported — e.g. "GK420t (fw V61.17.17Z)". Surface
+            // it here so the right pane matches what the HTML report shows.
+            if (!h.printerModel.empty()) {
+                HFONT mf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().semibold));
+                SetTextColor(memDc, theme::Get(theme::Color::TextPrimary));
+                RECT rcModel = { padL, y, W - padR, y + dpi::Scale(16) };
+                DrawTextW(memDc, h.printerModel.c_str(), -1, &rcModel,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                SelectObject(memDc, mf);
+                y += dpi::Scale(18);
+            }
+
+            // Serial number, when the device exposed one.
             if (!h.printerSerial.empty()) {
                 std::wstring head = L"SN ";
                 head += h.printerSerial;
@@ -780,6 +985,215 @@ void PaintPanel(HWND hwnd) {
                 SelectObject(memDc, pf);
                 y += (calc.bottom - calc.top);
             }
+
+            // v1.4.1 — lifetime page / scan counters; v1.4.2 adds a 5th
+            // free-text "usage" field for Zebra odometers ("total\tcolor\t
+            // mono\tscans\tusage").
+            if (!h.printerPages.empty()) {
+                std::wstring f[5];
+                {
+                    const std::wstring& p = h.printerPages;
+                    size_t i = 0; int idx = 0;
+                    while (idx < 5) {
+                        size_t t = p.find(L'\t', i);
+                        f[idx++] = p.substr(i,
+                            t == std::wstring::npos ? std::wstring::npos : t - i);
+                        if (t == std::wstring::npos) break;
+                        i = t + 1;
+                    }
+                }
+                // Thousands grouping (built left-to-right; no std::reverse).
+                auto grouped = [](const std::wstring& n) -> std::wstring {
+                    if (n.empty()) return n;
+                    int firstGroup = static_cast<int>(n.size() % 3);
+                    if (firstGroup == 0) firstGroup = 3;
+                    std::wstring out;
+                    for (size_t k = 0; k < n.size(); ++k) {
+                        if (k != 0 && static_cast<int>(k) >= firstGroup
+                            && (static_cast<int>(k) - firstGroup) % 3 == 0)
+                            out.push_back(L',');
+                        out.push_back(n[k]);
+                    }
+                    return out;
+                };
+                std::vector<std::wstring> lines;
+                if (!f[0].empty()) lines.push_back(L"Pages printed (life): " + grouped(f[0]));
+                {
+                    std::wstring cm;
+                    if (!f[1].empty()) cm += L"Color " + grouped(f[1]);
+                    if (!f[2].empty()) {
+                        if (!cm.empty()) cm += L"   \xb7   ";
+                        cm += L"Mono " + grouped(f[2]);
+                    }
+                    if (!cm.empty()) lines.push_back(cm);
+                }
+                if (!f[3].empty()) lines.push_back(L"Scans: " + grouped(f[3]));
+                if (!f[4].empty()) lines.push_back(L"Media printed: " + f[4]);
+
+                if (!lines.empty()) {
+                    HFONT hf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().semibold));
+                    SetTextColor(memDc, theme::Get(theme::Color::TextSecondary));
+                    RECT rcPC = { padL, y, W - padR, y + dpi::Scale(16) };
+                    DrawTextW(memDc, L"Page counts", -1, &rcPC,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(memDc, hf);
+                    y += dpi::Scale(18);
+                    HFONT pf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().regular));
+                    SetTextColor(memDc, theme::Get(theme::Color::TextPrimary));
+                    for (const auto& ln : lines) {
+                        RECT rcL = { padL, y, W - padR, y + dpi::Scale(18) };
+                        DrawTextW(memDc, ln.c_str(), -1, &rcL,
+                                  DT_LEFT | DT_VCENTER | DT_SINGLELINE
+                                  | DT_END_ELLIPSIS | DT_NOPREFIX);
+                        y += dpi::Scale(18);
+                    }
+                    SelectObject(memDc, pf);
+                }
+            }
+            y += dpi::Scale(10);
+        }
+
+        // ---- IoT fingerprint (v1.5.0 — Roborock / Xiaomi vacuums) ----
+        // Line 0 of the blob is "<score>\t<label>"; the rest are evidence
+        // lines shown verbatim (word-wrapped). A "SECURITY:" line is drawn
+        // in the danger colour.
+        if (!h.iotFingerprint.empty()) {
+            DrawSectionHeader(memDc, { padL, y, W - padR, y + dpi::Scale(16) },
+                              L"DEVICE FINGERPRINT");
+            y += dpi::Scale(22);
+
+            const std::wstring& s = h.iotFingerprint;
+            size_t firstEol = s.find(L"\r\n");
+            std::wstring head = (firstEol == std::wstring::npos)
+                                  ? s : s.substr(0, firstEol);
+            int score = 0; std::wstring label;
+            size_t tab = head.find(L'\t');
+            if (tab != std::wstring::npos) {
+                for (wchar_t c : head.substr(0, tab))
+                    if (c >= L'0' && c <= L'9') score = score * 10 + (c - L'0');
+                label = head.substr(tab + 1);
+            } else { label = head; }
+
+            // Confidence headline, coloured by score.
+            COLORREF hc = (score >= 90) ? theme::Get(theme::Color::Success)
+                        : (score >= 70) ? theme::Get(theme::Color::Accent)
+                        :                 theme::Get(theme::Color::Warning);
+            HFONT hf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().semibold));
+            SetTextColor(memDc, hc);
+            wchar_t hl[96];
+            swprintf_s(hl, L"%s  (%d%% confidence)", label.c_str(), score);
+            RECT rcH = { padL, y, W - padR, y + dpi::Scale(18) };
+            DrawTextW(memDc, hl, -1, &rcH,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(memDc, hf);
+            y += dpi::Scale(20);
+
+            HFONT pf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().regular));
+            size_t i = (firstEol == std::wstring::npos) ? s.size() : firstEol + 2;
+            while (i < s.size()) {
+                size_t eol = s.find(L"\r\n", i);
+                std::wstring line = s.substr(i,
+                    eol == std::wstring::npos ? std::wstring::npos : eol - i);
+                i = (eol == std::wstring::npos) ? s.size() : eol + 2;
+                if (line.empty()) continue;
+                const bool sec = line.rfind(L"SECURITY", 0) == 0;
+                SetTextColor(memDc, sec ? theme::Get(theme::Color::Danger)
+                                        : theme::Get(theme::Color::TextSecondary));
+                RECT rcL = { padL + dpi::Scale(2), y, W - padR, y + dpi::Scale(400) };
+                RECT calc = rcL;
+                DrawTextW(memDc, line.c_str(), -1, &calc,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+                DrawTextW(memDc, line.c_str(), -1, &rcL,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+                y += (calc.bottom - calc.top) + dpi::Scale(2);
+            }
+            SelectObject(memDc, pf);
+            y += dpi::Scale(10);
+        }
+
+        // ---- SMB shares (v1.4.5 — anonymous NetShareEnum) ----
+        // One row per exposed share: name (accent) + type/remark (muted).
+        if (!h.smbShares.empty()) {
+            DrawSectionHeader(memDc, { padL, y, W - padR, y + dpi::Scale(16) },
+                              L"SMB SHARES");
+            y += dpi::Scale(22);
+
+            const int colNameW = dpi::Scale(150);
+            const int colX0 = padL;
+            const int colX1 = colX0 + colNameW + dpi::Scale(8);
+            const int colDetW = (W - padR) - colX1;
+            const int rowH = dpi::Scale(20);
+
+            const std::wstring& s = h.smbShares;
+            size_t i = 0;
+            HFONT pf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().regular));
+            while (i < s.size()) {
+                size_t eol = s.find(L"\r\n", i);
+                std::wstring line = s.substr(i,
+                    eol == std::wstring::npos ? std::wstring::npos : eol - i);
+                i = (eol == std::wstring::npos) ? s.size() : eol + 2;
+                if (line.empty()) continue;
+                std::wstring name, type, remark;
+                auto take = [&](std::wstring& dst) {
+                    size_t t = line.find(L'\t');
+                    if (t == std::wstring::npos) { dst = line; line.clear(); }
+                    else { dst = line.substr(0, t); line.erase(0, t + 1); }
+                };
+                take(name); take(type); remark = line;
+
+                // UNC path for this share — "\\<ip>\<share>".
+                const std::wstring unc = L"\\\\" + h.ip + L"\\" + name;
+
+                HFONT sf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().semibold));
+                SetTextColor(memDc, theme::Get(theme::Color::Accent));
+                RECT rcN = { colX0, y, colX0 + colNameW, y + rowH };
+                DrawTextW(memDc, name.c_str(), -1, &rcN,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                // Clickable open hit on the share name → ShellExecute the UNC.
+                {
+                    SIZE nsz{};
+                    GetTextExtentPoint32W(memDc, name.c_str(),
+                                          static_cast<int>(name.size()), &nsz);
+                    CopyHit openHit;
+                    openHit.kind = CopyKind::SmbShareOpen;
+                    openHit.rc = { colX0, y + bodyDelta,
+                                   colX0 + std::min(static_cast<int>(nsz.cx) + dpi::Scale(4), colNameW),
+                                   y + rowH + bodyDelta };
+                    if (openHit.rc.top >= bodyStart && openHit.rc.bottom <= H) {
+                        openHit.customText = unc;
+                        st->copyHits.push_back(std::move(openHit));
+                    }
+                }
+                SelectObject(memDc, sf);
+
+                SetTextColor(memDc, theme::Get(theme::Color::TextSecondary));
+                std::wstring det = type;
+                if (!remark.empty()) { det += L"  \x2014  "; det += remark; }
+                RECT rcD = { colX1, y, colX1 + colDetW, y + rowH };
+                DrawTextW(memDc, det.c_str(), -1, &rcD,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+                // Copy-UNC glyph on the right edge.
+                {
+                    const int gW = dpi::Scale(24);
+                    const int gx = W - padR - gW;
+                    HFONT cf = static_cast<HFONT>(SelectObject(memDc, theme::Fonts().regular));
+                    SetTextColor(memDc, theme::Get(theme::Color::TextMuted));
+                    RECT rcG = { gx, y, gx + gW, y + rowH };
+                    DrawTextW(memDc, L"\x29c9", -1, &rcG,
+                              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    SelectObject(memDc, cf);
+                    CopyHit copyHit;
+                    copyHit.kind = CopyKind::SmbShareCopy;
+                    copyHit.rc = { gx, y + bodyDelta, gx + gW, y + rowH + bodyDelta };
+                    if (copyHit.rc.top >= bodyStart && copyHit.rc.bottom <= H) {
+                        copyHit.customText = unc;
+                        st->copyHits.push_back(std::move(copyHit));
+                    }
+                }
+                y += rowH;
+            }
+            SelectObject(memDc, pf);
             y += dpi::Scale(10);
         }
 
@@ -1182,8 +1596,11 @@ void OnCommand(HWND hwnd, int id) {
             if (!h.hostname.empty())   rpt += L"Hostname: "   + h.hostname   + L"\r\n";
             if (!h.mac.empty())        rpt += L"MAC: "        + h.mac        + L"\r\n";
             if (!h.vendor.empty())     rpt += L"Vendor: "     + h.vendor     + L"\r\n";
-            if (!h.deviceType.empty()) rpt += L"Device: "     + h.deviceType + L"\r\n";
+            if (!h.deviceType.empty()) rpt += L"Device Type: " + h.deviceType + L"\r\n";
+            if (!h.deviceModel.empty() && h.deviceModel != h.printerModel)
+                rpt += L"Model: "      + h.deviceModel + L"\r\n";
             if (!h.openPorts.empty())  rpt += L"Open TCP ports: " + h.openPorts + L"\r\n";
+            if (!h.services.empty())   rpt += L"Services: "   + h.services   + L"\r\n";
             if (!h.brandHint.empty())  rpt += L"Brand hint: " + h.brandHint  + L"\r\n";
             if (!h.osHint.empty())     rpt += L"OS hint: "    + h.osHint     + L"\r\n";
 
@@ -1194,6 +1611,21 @@ void OnCommand(HWND hwnd, int id) {
                 if (!h.printerModel.empty())  rpt += L"Model: "  + h.printerModel  + L"\r\n";
                 if (!h.printerSerial.empty()) rpt += L"Serial: " + h.printerSerial + L"\r\n";
                 if (!h.printerSnmpStatus.empty()) rpt += L"SNMP status: " + h.printerSnmpStatus + L"\r\n";
+                // v1.4.1 — page / scan counters ("total\tcolor\tmono\tscans").
+                if (!h.printerPages.empty()) {
+                    std::wstring pf[5]; size_t pi = 0; int pidx = 0;
+                    while (pidx < 5) {
+                        size_t t = h.printerPages.find(L'\t', pi);
+                        pf[pidx++] = h.printerPages.substr(pi,
+                            t == std::wstring::npos ? std::wstring::npos : t - pi);
+                        if (t == std::wstring::npos) break; pi = t + 1;
+                    }
+                    if (!pf[0].empty()) rpt += L"Pages printed (life): " + pf[0] + L"\r\n";
+                    if (!pf[1].empty()) rpt += L"  Color pages: " + pf[1] + L"\r\n";
+                    if (!pf[2].empty()) rpt += L"  Mono pages: "  + pf[2] + L"\r\n";
+                    if (!pf[3].empty()) rpt += L"  Scans: "       + pf[3] + L"\r\n";
+                    if (!pf[4].empty()) rpt += L"  Media printed: " + pf[4] + L"\r\n";
+                }
                 // Parse tab-encoded supplies into a readable list.
                 const std::wstring& s = h.printerSupplies;
                 size_t i = 0;
@@ -1218,6 +1650,30 @@ void OnCommand(HWND hwnd, int id) {
                         rpt += L" ("; rpt += lvl; rpt += L"/"; rpt += mx; rpt += L")";
                     }
                     if (!desc.empty()) { rpt += L"  \x2014  "; rpt += desc; }
+                    rpt += L"\r\n";
+                }
+            }
+
+            // SMB shares block (v1.4.5).
+            if (!h.smbShares.empty()) {
+                rpt += L"\r\n-- SMB shares ----\r\n";
+                const std::wstring& sh = h.smbShares;
+                size_t i = 0;
+                while (i < sh.size()) {
+                    size_t eol = sh.find(L"\r\n", i);
+                    std::wstring line = sh.substr(i,
+                        eol == std::wstring::npos ? std::wstring::npos : eol - i);
+                    i = (eol == std::wstring::npos) ? sh.size() : eol + 2;
+                    if (line.empty()) continue;
+                    std::wstring name, type, remark;
+                    auto take = [&](std::wstring& dst) {
+                        size_t t = line.find(L'\t');
+                        if (t == std::wstring::npos) { dst = line; line.clear(); }
+                        else { dst = line.substr(0, t); line.erase(0, t + 1); }
+                    };
+                    take(name); take(type); remark = line;
+                    rpt += L"  " + name + L"  (" + type + L")";
+                    if (!remark.empty()) rpt += L"  \x2014  " + remark;
                     rpt += L"\r\n";
                 }
             }
@@ -1297,6 +1753,21 @@ void CopyFieldByKind(HWND hwnd, CopyKind kind) {
             if (!h.printerSerial.empty()) { composed += L"Serial: "; composed += h.printerSerial; composed += L"\r\n"; }
             if (!h.printerSnmpStatus.empty()) {
                 composed += L"SNMP: "; composed += h.printerSnmpStatus; composed += L"\r\n";
+            }
+            // v1.4.1 — page / scan counters ("total\tcolor\tmono\tscans").
+            if (!h.printerPages.empty()) {
+                std::wstring pf[5]; size_t pp = 0; int pidx = 0;
+                while (pidx < 5) {
+                    size_t t = h.printerPages.find(L'\t', pp);
+                    pf[pidx++] = h.printerPages.substr(pp,
+                        t == std::wstring::npos ? std::wstring::npos : t - pp);
+                    if (t == std::wstring::npos) break; pp = t + 1;
+                }
+                if (!pf[0].empty()) { composed += L"Pages printed (life): "; composed += pf[0]; composed += L"\r\n"; }
+                if (!pf[1].empty()) { composed += L"Color pages: "; composed += pf[1]; composed += L"\r\n"; }
+                if (!pf[2].empty()) { composed += L"Mono pages: ";  composed += pf[2]; composed += L"\r\n"; }
+                if (!pf[3].empty()) { composed += L"Scans: ";       composed += pf[3]; composed += L"\r\n"; }
+                if (!pf[4].empty()) { composed += L"Media printed: "; composed += pf[4]; composed += L"\r\n"; }
             }
             // Parse the tab-encoded supplies blob into "Color: pct (level/max) — desc" lines.
             const std::wstring& s = h.printerSupplies;
@@ -1418,8 +1889,36 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DP_SET_HOST: {
             if (State* st = Get(hwnd)) {
-                st->hostIndex = static_cast<int>(wp);
-                st->scrollY   = 0;
+                int newIdx = static_cast<int>(wp);
+
+                // Identity check by IP, not index. Snapshots re-stamp
+                // SetHostIndex every 100 ms with the same selected host
+                // (during scan) — and at end-of-scan the engine
+                // reshuffles hosts_ into final sort order so the same
+                // host arrives at a NEW array index. Both cases share
+                // the same IP; both should preserve scroll.
+                std::wstring newIp;
+                const auto& hosts = App::Instance().Hosts();
+                if (newIdx >= 0
+                    && newIdx < static_cast<int>(hosts.size())) {
+                    newIp = hosts[newIdx].ip;
+                }
+
+                const bool sameHost = !newIp.empty()
+                                   && newIp == st->lastHostIp;
+
+                st->hostIndex  = newIdx;
+                st->lastHostIp = newIp;
+
+                if (sameHost) {
+                    // Same host (possibly at a new index after reshuffle).
+                    // Keep scrollY so the user's place in the OPEN TCP
+                    // PORTS / SECURITY FINDINGS sections survives. Only
+                    // repaint so newly-arrived port detail shows up.
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                st->scrollY    = 0;
                 st->actionRowY = 0;   // force LayoutButtons recompute
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -1463,7 +1962,34 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt = { LOWORD(lp), HIWORD(lp) };
             for (const auto& a : st->copyHits) {
                 if (PtInRect(&a.rc, pt)) {
-                    CopyFieldByKind(hwnd, a.kind);
+                    // Findings carry a per-row URL on customText since
+                    // CopyKind alone can't disambiguate which CVE link
+                    // to act on. Two finding actions:
+                    //   FindingOpenUrl → launch default browser at the
+                    //                    URL (ShellExecuteW). Triggered
+                    //                    when the user clicks the
+                    //                    blue CVE-ID text itself.
+                    //   FindingUrl     → copy the URL to clipboard.
+                    //                    Triggered by the ⧉ glyph on
+                    //                    the right edge of the row.
+                    // Other CopyKinds dispatch to the static field map.
+                    if (a.kind == CopyKind::FindingOpenUrl
+                     || a.kind == CopyKind::SmbShareOpen) {
+                        // Open: a CVE reference URL in the browser, or an SMB
+                        // share UNC ("\\ip\share") in Explorer. ShellExecuteW
+                        // is async — never blocks the UI thread.
+                        if (!a.customText.empty()) {
+                            ShellExecuteW(hwnd, L"open",
+                                          a.customText.c_str(),
+                                          nullptr, nullptr, SW_SHOWNORMAL);
+                        }
+                    } else if (a.kind == CopyKind::FindingUrl
+                            || a.kind == CopyKind::SmbShareCopy) {
+                        if (!a.customText.empty())
+                            SetClipboardText(hwnd, a.customText);
+                    } else {
+                        CopyFieldByKind(hwnd, a.kind);
+                    }
                     return 0;
                 }
             }

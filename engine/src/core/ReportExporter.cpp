@@ -31,9 +31,18 @@ std::string csvEscape(const std::wstring& w) {
     // evaluate as a formula gets a leading apostrophe so it renders as
     // literal text. Several v1.2 columns (service banners, HTTP headers,
     // the signed clock offset) carry untrusted network-sourced strings.
-    if (!s.empty() && (s[0] == '=' || s[0] == '+' || s[0] == '-' ||
-                       s[0] == '@' || s[0] == '\t' || s[0] == '\r')) {
-        s.insert(s.begin(), '\'');
+    // Skip leading spaces/tabs before testing the first significant char —
+    // several spreadsheets trim leading whitespace before evaluating, so
+    // " =HYPERLINK(...)" would still fire. Also cover '|' (DDE) and a leading
+    // CR (CSV row-smuggling).
+    {
+        size_t fc = 0;
+        while (fc < s.size() && (s[fc] == ' ' || s[fc] == '\t')) ++fc;
+        bool danger = (fc < s.size() &&
+                       (s[fc] == '=' || s[fc] == '+' || s[fc] == '-' ||
+                        s[fc] == '@' || s[fc] == '|'))
+                   || (!s.empty() && s[0] == '\r');
+        if (danger) s.insert(s.begin(), '\'');
     }
 
     bool mustQuote = false;
@@ -261,9 +270,40 @@ table.udp-table td.port { font-family:Consolas,'Courier New',monospace;
                           font-variant-numeric:tabular-nums; }
 table.udp-table td.svc  { width:130px; font-weight:600; color:#1e3a8a; }
 table.udp-table td.detail { color:#374151; word-break:break-word; }
+/* v1.3.2 — Security findings (heuristic CVEs + EOL) */
+section.findings { padding:8px 32px 4px; }
+.find-host { background:#fff; border-radius:8px; margin-bottom:14px;
+             box-shadow:0 1px 2px rgba(0,0,0,.05); overflow:hidden; }
+.find-host-head { padding:9px 14px; background:#f9fafb;
+                  border-bottom:1px solid #e5e7eb; font-weight:600; }
+.find-host-head .ip { font-family:Consolas,'Courier New',monospace; }
+.find-host-head .hn { color:#6b7280; font-weight:400; margin-left:10px; }
+.find-host-head .count { float:right; color:#6b7280; font-weight:400;
+                         font-size:12px; }
+ul.findings-list { margin:0; padding:6px 14px 10px; list-style:none; }
+ul.findings-list li { padding:7px 0; border-bottom:1px solid #f3f4f6;
+                      font-size:13px; }
+ul.findings-list li:last-child { border-bottom:0; }
+ul.findings-list .sev { display:inline-block; font-weight:600;
+                        text-transform:uppercase; letter-spacing:.04em;
+                        font-size:11px; margin-right:8px; min-width:64px; }
+ul.findings-list .sev-critical { color:#dc2626; }
+ul.findings-list .sev-high     { color:#ea580c; }
+ul.findings-list .sev-medium   { color:#d97706; }
+ul.findings-list .sev-low      { color:#a16207; }
+ul.findings-list .id { font-family:Consolas,'Courier New',monospace;
+                       font-weight:600; color:#1e3a8a; margin-right:8px; }
+ul.findings-list .id a { color:#1e3a8a; text-decoration:none; }
+ul.findings-list .id a:hover { text-decoration:underline; }
+ul.findings-list .title { color:#374151; }
+.findings-disclaimer { color:#92400e; background:#fef3c7;
+                       border-left:4px solid #d97706; padding:10px 14px;
+                       border-radius:6px; margin:0 0 14px 0;
+                       font-size:12.5px; }
 @media (max-width:600px) { header.app-header,.summary,section.results,
                            section.fingerprints,section.devices,
                            section.printers,section.udp,
+                           section.findings,
                            section.notes { padding-left:16px;
                            padding-right:16px; } }
 )CSS";
@@ -337,6 +377,105 @@ void appendDeviceBreakdown(std::ostringstream& os, const ScanSummary& summary) {
            << " <b>&times;" << kv.second << "</b></span>";
     }
     os << "</div></section>";
+}
+
+// v1.3.2 — Security findings section. Heuristic CVE / lifecycle matches
+// produced by SecurityAdvisor. Only RCE and credential-takeover CVEs are
+// surfaced (no DoS / info-disclosure / configuration-tweak CVEs) plus
+// end-of-life lifecycle hits for major platforms. The disclaimer banner
+// makes clear this is a banner-matching heuristic, not a configuration
+// audit — operators who've patched in place without bumping their
+// banners may show false positives.
+void appendSecurityFindingsSection(std::ostringstream& os,
+                                   const std::vector<ScanResult>& sorted) {
+    // Cheap early-out — skip the section header entirely when nothing
+    // matched on any host.
+    bool anyHost = false;
+    for (const auto& r : sorted) {
+        if (!r.securityFindings.empty()) { anyHost = true; break; }
+    }
+    if (!anyHost) return;
+
+    os << "<section class=\"findings\"><h2>Security findings</h2>";
+    os << "<p class=\"findings-disclaimer\">"
+          "&#9888; Heuristic based on banners and protocol negotiations &mdash; "
+          "not a configuration audit. False positives possible if a host has "
+          "been patched in place without updating its banner. Verify each "
+          "match against the actual installed version."
+          "</p>";
+
+    for (const auto& r : sorted) {
+        if (r.securityFindings.empty()) continue;
+
+        // Parse the engine's TAB/newline-serialized findings into rows.
+        // Each line: severity \t id \t title \t url
+        struct Row { std::wstring sev, id, title, url; };
+        std::vector<Row> rows;
+        {
+            const std::wstring& s = r.securityFindings;
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t eol = s.find(L'\n', i);
+                std::wstring line = s.substr(i,
+                    eol == std::wstring::npos ? std::wstring::npos : eol - i);
+                i = (eol == std::wstring::npos) ? s.size() : eol + 1;
+                if (line.empty()) continue;
+                Row row{};
+                size_t t1 = line.find(L'\t');
+                if (t1 == std::wstring::npos) continue;
+                size_t t2 = line.find(L'\t', t1 + 1);
+                if (t2 == std::wstring::npos) continue;
+                size_t t3 = line.find(L'\t', t2 + 1);
+                row.sev = line.substr(0, t1);
+                row.id  = line.substr(t1 + 1, t2 - t1 - 1);
+                if (t3 == std::wstring::npos) {
+                    row.title = line.substr(t2 + 1);
+                } else {
+                    row.title = line.substr(t2 + 1, t3 - t2 - 1);
+                    row.url   = line.substr(t3 + 1);
+                }
+                rows.push_back(std::move(row));
+            }
+        }
+        if (rows.empty()) continue;
+
+        os << "<div class=\"find-host\"><div class=\"find-host-head\">";
+        os << "<span class=\"ip\">" << htmlEscape(r.ipAddress) << "</span>";
+        if (!r.hostname.empty())
+            os << "<span class=\"hn\">" << htmlEscape(r.hostname) << "</span>";
+        os << "<span class=\"count\">" << rows.size()
+           << (rows.size() == 1 ? " finding" : " findings") << "</span>";
+        os << "</div>";
+
+        os << "<ul class=\"findings-list\">";
+        for (const auto& row : rows) {
+            // Severity class — defensive, fall back to medium if the
+            // engine emitted something we don't recognise.
+            std::string sevClass = "sev-medium";
+            std::string sevLabel = "MEDIUM";
+            if (row.sev == L"critical") { sevClass = "sev-critical"; sevLabel = "CRITICAL"; }
+            else if (row.sev == L"high")    { sevClass = "sev-high";     sevLabel = "HIGH"; }
+            else if (row.sev == L"medium")  { sevClass = "sev-medium";   sevLabel = "MEDIUM"; }
+            else if (row.sev == L"low")     { sevClass = "sev-low";      sevLabel = "LOW"; }
+
+            os << "<li>";
+            os << "<span class=\"sev " << sevClass << "\">" << sevLabel << "</span>";
+            os << "<span class=\"id\">";
+            if (!row.url.empty()) {
+                os << "<a href=\"" << htmlEscape(row.url)
+                   << "\" rel=\"noopener nofollow\" target=\"_blank\">"
+                   << htmlEscape(row.id) << "</a>";
+            } else {
+                os << htmlEscape(row.id);
+            }
+            os << "</span>";
+            os << "<span class=\"title\">" << htmlEscape(row.title) << "</span>";
+            os << "</li>";
+        }
+        os << "</ul></div>";
+    }
+
+    os << "</section>";
 }
 
 // v1.2 — a per-host "Service fingerprints" section listing each lightweight,
@@ -503,6 +642,35 @@ void appendPrinterSection(std::ostringstream& os,
             os << "<span><b>Serial</b> "  << htmlEscape(r.printerSerial) << "</span>";
         if (!r.printerSnmpStatus.empty())
             os << "<span><b>SNMP</b> "    << htmlEscape(r.printerSnmpStatus) << "</span>";
+        // v1.4.1 — lifetime page / scan counters ("total\tcolor\tmono\tscans").
+        if (!r.printerPages.empty()) {
+            std::wstring f[5];
+            { size_t i = 0; int idx = 0; const std::wstring& p = r.printerPages;
+              while (idx < 5) { size_t t = p.find(L'\t', i);
+                  f[idx++] = p.substr(i, t == std::wstring::npos ? std::wstring::npos : t - i);
+                  if (t == std::wstring::npos) break; i = t + 1; } }
+            auto grouped = [](const std::wstring& n) -> std::wstring {
+                if (n.empty()) return n;
+                int fg = static_cast<int>(n.size() % 3); if (fg == 0) fg = 3;
+                std::wstring o;
+                for (size_t k = 0; k < n.size(); ++k) {
+                    if (k != 0 && static_cast<int>(k) >= fg
+                        && (static_cast<int>(k) - fg) % 3 == 0) o.push_back(L',');
+                    o.push_back(n[k]);
+                }
+                return o;
+            };
+            if (!f[0].empty())
+                os << "<span><b>Pages</b> " << htmlEscape(grouped(f[0])) << "</span>";
+            if (!f[1].empty())
+                os << "<span><b>Color</b> " << htmlEscape(grouped(f[1])) << "</span>";
+            if (!f[2].empty())
+                os << "<span><b>Mono</b> "  << htmlEscape(grouped(f[2])) << "</span>";
+            if (!f[3].empty())
+                os << "<span><b>Scans</b> " << htmlEscape(grouped(f[3])) << "</span>";
+            if (!f[4].empty())   // free-text usage (Zebra odometer)
+                os << "<span><b>Media printed</b> " << htmlEscape(f[4]) << "</span>";
+        }
         os << "</div>";
         os << "</div>";
 
@@ -631,6 +799,66 @@ void appendUdpDiscoverySection(std::ostringstream& os,
     os << "</section>";
 }
 
+// v1.4.5 — exposed SMB shares (anonymous NetShareEnum). Reuses the UDP
+// section's CSS classes to avoid new styles.
+void appendSharesSection(std::ostringstream& os,
+                         const std::vector<ScanResult>& sorted) {
+    bool any = false;
+    for (const auto& r : sorted) {
+        if (!r.smbShares.empty()) { any = true; break; }
+    }
+    if (!any) return;
+
+    os << "<section class=\"udp\"><h2>SMB shares</h2>";
+    os << "<p class=\"fp-note\">Exposed shares enumerated anonymously via "
+          "<code>NetShareEnum</code> (names only, no contents accessed). The "
+          "IPC$ pipe is omitted; <code>$</code>-suffixed shares are hidden "
+          "admin shares.</p>";
+
+    for (const auto& r : sorted) {
+        if (r.smbShares.empty()) continue;
+        os << "<div class=\"udp-card\"><div class=\"udp-head\">";
+        os << "<span class=\"ip\">" << htmlEscape(r.ipAddress) << "</span>";
+        if (!r.hostname.empty())
+            os << "<span class=\"hn\">" << htmlEscape(r.hostname) << "</span>";
+        os << "</div>";
+
+        os << "<table class=\"udp-table\"><thead><tr>"
+              "<th>Share</th><th>Type</th><th>Remark</th>"
+              "</tr></thead><tbody>";
+        const std::wstring& s = r.smbShares;
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t eol = s.find(L"\r\n", i);
+            std::wstring line = s.substr(i,
+                eol == std::wstring::npos ? std::wstring::npos : eol - i);
+            i = (eol == std::wstring::npos) ? s.size() : eol + 2;
+            if (line.empty()) continue;
+            std::wstring name, type, remark;
+            size_t t1 = line.find(L'\t');
+            if (t1 != std::wstring::npos) {
+                name = line.substr(0, t1);
+                size_t t2 = line.find(L'\t', t1 + 1);
+                if (t2 != std::wstring::npos) {
+                    type   = line.substr(t1 + 1, t2 - t1 - 1);
+                    remark = line.substr(t2 + 1);
+                } else {
+                    type = line.substr(t1 + 1);
+                }
+            } else {
+                name = line;
+            }
+            os << "<tr>";
+            os << "<td class=\"svc\">"    << htmlEscape(name)   << "</td>";
+            os << "<td class=\"port\">"   << htmlEscape(type)   << "</td>";
+            os << "<td class=\"detail\">" << htmlEscape(remark) << "</td>";
+            os << "</tr>";
+        }
+        os << "</tbody></table></div>";
+    }
+    os << "</section>";
+}
+
 std::string ReportExporter::buildHtml(const std::vector<ScanResult>& results,
                                       const ScanSummary& summary)
 {
@@ -652,7 +880,10 @@ std::string ReportExporter::buildHtml(const std::vector<ScanResult>& results,
     std::ostringstream os;
     os << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"/>";
     os << "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>";
-    os << "<title>" << toUtf8(kAppName) << " - Scan Report</title>";
+    // v1.3.5 — defensive htmlEscape on kAppName even though it's currently a
+    // compile-time constant ("NetLens"). If the brand name ever changes to
+    // include `<`, `>`, `&`, or quotes, this keeps the <title> well-formed.
+    os << "<title>" << htmlEscape(kAppName) << " - Scan Report</title>";
     os << "<style>" << kEmbeddedCss << "</style>";
     os << "</head><body>";
 
@@ -666,8 +897,10 @@ std::string ReportExporter::buildHtml(const std::vector<ScanResult>& results,
     //   - Duration (how long)
     //   - Status pill (Completed / Cancelled)
     os << "<header class=\"app-header\">";
-    os << "<h1>" << toUtf8(kAppName) << "</h1>";
-    os << "<div class=\"subtitle\">" << toUtf8(kAppSubtitle) << "</div>";
+    // v1.3.5 — same defensive htmlEscape applied to <h1>, subtitle, footer
+    // (see <title> tag above for rationale).
+    os << "<h1>" << htmlEscape(kAppName) << "</h1>";
+    os << "<div class=\"subtitle\">" << htmlEscape(kAppSubtitle) << "</div>";
     os << "<div class=\"meta\">";
     os << "<div><span class=\"label\">Scan date:</span> " << htmlEscape(summary.startedAt) << "</div>";
     os << "<div><span class=\"label\">Range:</span> "     << htmlEscape(summary.rangeUsed) << "</div>";
@@ -732,7 +965,7 @@ std::string ReportExporter::buildHtml(const std::vector<ScanResult>& results,
     // screen without horizontal scroll.
     os << "<section class=\"results\"><h2>Hosts</h2><table>";
     os << "<thead><tr>";
-    os << "<th>IP</th><th>Status</th><th>Hostname</th><th>Device</th>";
+    os << "<th>IP</th><th>Status</th><th>Hostname</th><th>Device Type</th><th>Model</th>";
     os << "<th>MAC</th><th>Vendor</th>";
     os << "<th>Open TCP ports</th><th>Services</th>";
     os << "<th class=\"num\">RTT</th></tr></thead><tbody>";
@@ -744,7 +977,8 @@ std::string ReportExporter::buildHtml(const std::vector<ScanResult>& results,
            << (r.isOnline ? "badge-online" : "badge-offline") << "\">"
            << htmlEscape(r.statusText()) << "</span></td>";
         os << "<td>"                << htmlEscape(r.hostname)     << "</td>";
-        os << "<td>"                << htmlEscape(r.deviceText()) << "</td>";
+        os << "<td>"                << htmlEscape(r.deviceType)   << "</td>";
+        os << "<td>"                << htmlEscape(r.deviceModel)  << "</td>";
         os << "<td class=\"mac\">"  << htmlEscape(r.macAddress)   << "</td>";
         os << "<td>"                << htmlEscape(r.vendor)       << "</td>";
         os << "<td>"                << htmlEscape(r.openPortsText())     << "</td>";
@@ -763,11 +997,19 @@ std::string ReportExporter::buildHtml(const std::vector<ScanResult>& results,
     }
     os << "</tbody></table></section>";
 
+    // ----- Security findings (v1.3.2) -----
+    // Heuristic CVE / lifecycle hits. Placed between the Hosts table
+    // (where the user is reading "what's on my network") and Service
+    // fingerprints (where they'll be looking up banners). The disclaimer
+    // banner in the section makes the heuristic nature explicit.
+    appendSecurityFindingsSection(os, sorted);
+
     // ----- Service fingerprints (v1.2) -----
     appendFingerprintSection(os, sorted);
 
     // ----- Printer supplies (v1.0.38) -----
     appendPrinterSection(os, sorted);
+    appendSharesSection(os, sorted);
 
     // ----- UDP discovery (v1.0.38) -----
     appendUdpDiscoverySection(os, sorted);
@@ -781,7 +1023,8 @@ std::string ReportExporter::buildHtml(const std::vector<ScanResult>& results,
        << "</p></section>";
 
     // ----- Footer -----
-    os << "<footer>Generated by " << toUtf8(kAppName) << " " << toUtf8(kAppVersion) << "</footer>";
+    os << "<footer>Generated by " << htmlEscape(kAppName) << " "
+       << htmlEscape(kAppVersion) << "</footer>";
     os << "</body></html>";
     return os.str();
 }

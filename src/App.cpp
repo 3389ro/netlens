@@ -11,6 +11,7 @@
 
 #include "netlens_engine.h"
 #include "MainWindow.h"   // WM_NL_APPLY_SNAPSHOT, WM_NL_SCAN_FINISHED
+#include "MockData.h"     // --mock fleet + embedded HTML report
 
 namespace nl {
 
@@ -154,7 +155,7 @@ void ParseBadges(HostRow& h) {
 // (which renders the port/service grid) read from these arrays.
 //   Quick      = 61 ports
 //   Standard   = 132 ports
-//   FullCommon = 231 ports
+//   FullCommon = 235 ports  (+9191/9192/9195 PaperCut, +58867 Roborock)
 // ---------------------------------------------------------------------------
 constexpr uint16_t kQuickPorts[] = {
     21, 22, 23, 25, 53, 80, 88, 110, 135, 137, 138, 139, 143, 161,
@@ -199,11 +200,14 @@ constexpr uint16_t kFullCommonPorts[] = {
     7001, 7070, 7547, 7777, 7946, 8000, 8001, 8008, 8080, 8081,
     8082, 8083, 8086, 8088, 8089, 8090, 8091, 8100, 8161, 8200,
     8333, 8383, 8443, 8500, 8554, 8649, 8834, 8880, 8883, 8888,
-    8983, 9000, 9001, 9042, 9043, 9090, 9092, 9100, 9200, 9300,
+    8983, 9000, 9001, 9042, 9043, 9090, 9092, 9100,
+    9191, 9192, 9195,                         // PaperCut NG/MF admin (CVE-2023-27350)
+    9200, 9300,
     9418, 9443, 9999, 10000, 10250, 10255, 10443, 11211, 15672,
     17988, 24800, 25565, 27017, 27018, 28015, 32400, 32764, 32768,
     32769, 32770, 32771, 32772, 32773, 32774, 32775, 37777, 49152,
     49153, 49154, 49155, 49156, 49157, 49158, 49159, 49160, 50000,
+    58867,                                    // Roborock local protocol (v1.5.0)
     62078,
 };
 
@@ -481,6 +485,29 @@ const std::unordered_map<uint16_t, const wchar_t*>& PortServiceMap() {
 // which the engine already guards internally).
 // ===========================================================================
 
+// v1.3.4 — Tiered scan estimator inputs.
+//
+// When the user picks AllPortsFast / AllPortsDeep, the scan is split into two
+// engine sessions: phase 1 runs a FullCommon (231-port) sweep so the user sees
+// services within seconds, then phase 2 runs the All-Ports sweep on the full
+// range. The estimator must show a stable ETA across the phase flip — without
+// this the % would crash from "100% of phase 1" to "0% of phase 2" the moment
+// nl_scanner_clear_results is called.
+//
+//   phase == 1: ScanSession projects the phase-2 cost upfront so
+//               probesTotalEstimate already includes both phases. probesDone
+//               grows naturally with phase-1 progress.
+//   phase == 2: ScanSession adds the (known, final) phase-1 probe count to
+//               BOTH probesDone and probesTotalEstimate. The new engine
+//               session's probesDone starts at 0 but the displayed counter
+//               continues from where phase 1 left off.
+struct TieredEstimatorInputs {
+    int     phase                = 0;   // 0 = non-tiered, 1 = phase 1 running, 2 = phase 2 running
+    int64_t phase1FinalProbes    = 0;   // valid when phase == 2: actual final probesDone from phase 1
+    int     phase2PortsPerHost   = 0;   // valid when phase == 1: per-online cost of the upcoming phase 2
+    int     phase2ScanMode       = 0;   // valid when phase == 1: ScanMode int of the upcoming phase 2
+};
+
 class ScanSession {
 public:
     // Mode-aware estimator.
@@ -505,10 +532,12 @@ public:
     //     - FullCommon (231, Deep): 58674 = 254 × 231
     //   Hence per-host = portsPerHost (Deep) or {portsPerHost / 26 / 0}
     //   depending on online-vs-offline and mode.
-    ScanSession(HWND uiHwnd, int portsPerHost, int scanModeInt)
+    ScanSession(HWND uiHwnd, int portsPerHost, int scanModeInt,
+                TieredEstimatorInputs tiered = {})
         : uiHwnd_(uiHwnd),
           portsPerHostEstimate_(portsPerHost > 0 ? portsPerHost : 32),
-          scanMode_(scanModeInt) {
+          scanMode_(scanModeInt),
+          tiered_(tiered) {
         thread_ = std::thread([this]() { runLoop(); });
     }
     ~ScanSession() {
@@ -531,8 +560,34 @@ private:
         while (!stop_.load()) {
             if (!g_scanner) break;
 
+            const bool wasRunning = (nl_scanner_is_running(g_scanner) != 0);
+
+            // Back-pressure: don't build a fresh snapshot (≈full host copy +
+            // string allocations) when a previous one is still sitting in
+            // the UI queue. On AllPortsFast / large ranges the UI thread
+            // can fall behind for hundreds of ms; without this each tick
+            // would heap-allocate ~5000-row vectors that pile up. The
+            // exception is the scan-just-ended tick — we must guarantee one
+            // final "isRunning=false" snapshot lands, otherwise the pill
+            // stays "Scanning…" forever.
+            const bool mustForce = (scanEverStarted && !wasRunning);
+            const bool canPost   = App::Instance().TryMarkSnapshotPending();
+            if (!canPost && !mustForce) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            // If we forced past back-pressure, mark pending so the receiver
+            // still calls ClearSnapshotPending() symmetrically.
+            if (mustForce && !canPost) {
+                // Already marked pending by an earlier tick — the UI will
+                // clear it. Either way we're going to post this final one.
+            }
+
             EngineSnapshot* snap = build();
-            if (!snap) break;
+            if (!snap) {
+                App::Instance().ClearSnapshotPending();
+                break;
+            }
 
             const bool isRunning = snap->isRunning;
             if (isRunning) scanEverStarted = true;
@@ -540,6 +595,7 @@ private:
             if (!PostMessageW(uiHwnd_, WM_NL_APPLY_SNAPSHOT, 0,
                               reinterpret_cast<LPARAM>(snap))) {
                 delete snap;
+                App::Instance().ClearSnapshotPending();
                 break;   // UI window gone
             }
 
@@ -695,6 +751,34 @@ private:
             // (e.g. more onlines than extrapolation expected). Always also
             // ensure we never display > 100% by clamping est >= probes.
             int64_t est = std::max(classModel, empirical);
+
+            // ---- v1.3.4: tiered phase-1 projects phase-2 cost upfront ----
+            // Phase 1 runs FullCommon (231 ports) on the full range. Phase 2
+            // will run the user's chosen All-Ports preset (65535 ports) on
+            // the same range. We add the deterministic phase-2 model now
+            // so % and ETA don't crash from 100% → 0% when phase 1 finishes
+            // and phase 2 resets nl_scanner_probes_done to 0.
+            if (tiered_.phase == 1 && tiered_.phase2PortsPerHost > 0) {
+                const int64_t p2PerOnline = tiered_.phase2PortsPerHost;
+                int64_t       p2PerOffline = 0;
+                switch (tiered_.phase2ScanMode) {
+                    case static_cast<int>(ScanMode::DiscoveryOnly):
+                        p2PerOffline = 0;
+                        break;
+                    case static_cast<int>(ScanMode::Fast):
+                        p2PerOffline = kFastDiscoveryPortCount;
+                        break;
+                    case static_cast<int>(ScanMode::Deep):
+                    default:
+                        p2PerOffline = tiered_.phase2PortsPerHost;
+                        break;
+                }
+                const int64_t p2Projection =
+                      static_cast<int64_t>(onlineEst)  * p2PerOnline
+                    + static_cast<int64_t>(offlineEst) * p2PerOffline;
+                est += p2Projection;
+            }
+
             if (est < probes) est = probes;   // never display > 100%
             if (est < 1)      est = 1;
             snap->probesTotalEstimate = est;
@@ -703,12 +787,23 @@ private:
             snap->probesTotalEstimate = std::max<int64_t>(probes, 1);
         }
 
+        // ---- v1.3.4: tiered phase-2 shifts probesDone + estimate baseline ----
+        // Phase 2 ran nl_scanner_clear_results(), so the engine's probesDone
+        // counter just restarted at 0. To keep the UI's running counter
+        // continuous across the phase flip, add the (frozen) phase-1 final
+        // probe count to BOTH the numerator and denominator. The % therefore
+        // resumes from "phase 1 fraction of total" instead of jumping to 0%.
+        if (tiered_.phase == 2 && tiered_.phase1FinalProbes > 0) {
+            snap->probesDone          += tiered_.phase1FinalProbes;
+            snap->probesTotalEstimate += tiered_.phase1FinalProbes;
+        }
+
         // ---- statusText (pill + status bar) ----
         if (isRunning) {
             wchar_t buf[64];
             int pct = 0;
-            if (snap->probesTotalEstimate > 0 && probes > 0) {
-                pct = static_cast<int>(probes * 100 / snap->probesTotalEstimate);
+            if (snap->probesTotalEstimate > 0 && snap->probesDone > 0) {
+                pct = static_cast<int>(snap->probesDone * 100 / snap->probesTotalEstimate);
             } else if (total > 0) {
                 pct = static_cast<int>((double)done / (double)total * 100.0);
             }
@@ -737,6 +832,58 @@ private:
             h.deviceModel    = Utf8ToWide(r.device_model);
             h.openPorts      = Utf8ToWide(r.open_ports);
             h.services       = Utf8ToWide(r.services);
+            // Parse the smallest port number out of the openPorts CSV
+            // (engine emits them ascending, so the first one is the
+            // smallest). Used as the sort key for the "Open TCP ports"
+            // grid column — see App::RebuildFilter case OpenPortCount.
+            {
+                int firstP = 0;
+                for (wchar_t c : h.openPorts) {
+                    if (c >= L'0' && c <= L'9') {
+                        firstP = firstP * 10 + (c - L'0');
+                        if (firstP > 65535) { firstP = 0; break; }
+                    } else if (firstP != 0) {
+                        break;   // hit the comma/space after the first int
+                    }
+                }
+                h.firstOpenPort = firstP;
+            }
+            // Parse the engine's TAB/newline-serialized security findings
+            // (v1.3.2). Engine emits one finding per line in the form:
+            //     severity\tid\ttitle\turl
+            // The engine pre-orders by severity (critical first); we
+            // preserve that ordering when pushing into HostRow.findings.
+            {
+                std::wstring sf = Utf8ToWide(r.security_findings);
+                size_t start = 0;
+                while (start < sf.size()) {
+                    size_t end = sf.find(L'\n', start);
+                    if (end == std::wstring::npos) end = sf.size();
+                    std::wstring line = sf.substr(start, end - start);
+                    start = end + 1;
+                    if (line.empty()) continue;
+                    // Split on tabs: severity \t id \t title \t url
+                    size_t t1 = line.find(L'\t');
+                    if (t1 == std::wstring::npos) continue;
+                    size_t t2 = line.find(L'\t', t1 + 1);
+                    if (t2 == std::wstring::npos) continue;
+                    size_t t3 = line.find(L'\t', t2 + 1);
+                    SecurityFinding sfRow;
+                    std::wstring sev = line.substr(0, t1);
+                    if      (sev == L"critical") sfRow.severity = FindingSeverity::Critical;
+                    else if (sev == L"high")     sfRow.severity = FindingSeverity::High;
+                    else if (sev == L"medium")   sfRow.severity = FindingSeverity::Medium;
+                    else                          sfRow.severity = FindingSeverity::Low;
+                    sfRow.id    = line.substr(t1 + 1, t2 - t1 - 1);
+                    if (t3 == std::wstring::npos) {
+                        sfRow.title = line.substr(t2 + 1);
+                    } else {
+                        sfRow.title = line.substr(t2 + 1, t3 - t2 - 1);
+                        sfRow.url   = line.substr(t3 + 1);
+                    }
+                    h.findings.push_back(std::move(sfRow));
+                }
+            }
             h.brandHint      = Utf8ToWide(r.brand_hint);
             h.osHint         = Utf8ToWide(r.os_hint);
             h.deviceHint     = Utf8ToWide(r.device_hint);
@@ -748,6 +895,9 @@ private:
             h.printerSerial     = Utf8ToWide(r.printer_serial);
             h.printerSnmpStatus = Utf8ToWide(r.printer_snmp_status);
             h.printerSupplies   = Utf8ToWide(r.printer_supplies);
+            h.printerPages      = Utf8ToWide(r.printer_pages);
+            h.smbShares         = Utf8ToWide(r.smb_shares);
+            h.iotFingerprint    = Utf8ToWide(r.iot_fingerprint);
             h.isOnline       = (r.is_online != 0);
             h.risk           = static_cast<RiskLevel>(r.risk_level);
             h.responseMs     = r.response_ms;
@@ -763,11 +913,12 @@ private:
         return snap;
     }
 
-    HWND              uiHwnd_;
-    int               portsPerHostEstimate_;
-    int               scanMode_;            // ScanMode as int (Discovery/Fast/Deep)
-    std::thread       thread_;
-    std::atomic<bool> stop_{false};
+    HWND                  uiHwnd_;
+    int                   portsPerHostEstimate_;
+    int                   scanMode_;            // ScanMode as int (Discovery/Fast/Deep)
+    TieredEstimatorInputs tiered_;
+    std::thread           thread_;
+    std::atomic<bool>     stop_{false};
 
     // Sliding-window rate sampler. 5-second window, linear regression
     // between first and last samples → smooth probes/sec that
@@ -826,6 +977,7 @@ void App::Shutdown() {
 void App::SetFilter(HostFilter f)         { filter_ = f;         RebuildFilter(); }
 void App::SetSearch(std::wstring s)       { search_ = std::move(s); RebuildFilter(); }
 void App::SetViewOffline(bool v)          { viewOffline_ = v;    RebuildFilter(); }
+void App::SetMinSeverity(SeverityFilter s){ minSeverity_ = s;    RebuildFilter(); }
 
 bool App::IsScanning() const {
     return g_scanner ? (nl_scanner_is_running(g_scanner) != 0) : false;
@@ -917,7 +1069,22 @@ int App::startScanInternal(const std::wstring& range, ScanPreset effPreset, HWND
     opts.want_printer_supplies  = (effPreset == ScanPreset::Quick) ? 0 : 1;
     opts.fingerprint_timeout_ms = settings_.fingerprintTimeoutMs;
     opts.ports_csv              = portsCsvU8.empty() ? nullptr : portsCsvU8.c_str();
-    opts.gateway_ip             = nullptr;
+
+    // v1.3.6 — Pass the local default gateway IP so the engine can hoist
+    // the WHOLE /24 containing that gateway to the front of the work queue
+    // (see prioritizeGatewayCandidates in ffi.cpp). On a /22+ scan this
+    // makes the user's actual LAN finish in seconds, before any unrelated
+    // sibling /24 gets touched.
+    std::string gwU8;   // must outlive nl_scanner_start
+    for (int i = 0, n = nl_adapters_count(); i < n; ++i) {
+        nl_adapter_t a{};
+        if (nl_adapters_get(i, &a) != 0) continue;
+        if (!a.operational || a.type == 3) continue;   // skip loopback / down
+        if (a.gateway[0] == 0) continue;
+        gwU8 = a.gateway;
+        break;
+    }
+    opts.gateway_ip = gwU8.empty() ? nullptr : gwU8.c_str();
 
     int rc = nl_scanner_start(g_scanner, rangeU8.c_str(), &opts);
 
@@ -945,21 +1112,63 @@ int App::startScanInternal(const std::wstring& range, ScanPreset effPreset, HWND
             for (wchar_t c : portsCsvW) if (c == L',') ++n;
             if (n > 0) portsPerHost = n;
         }
-        scanSession_ = std::make_unique<ScanSession>(uiHwnd, portsPerHost, opts.mode);
+
+        // v1.3.4 — Tiered scan estimator inputs.
+        // Phase 1: project the upcoming phase-2 cost so the ETA combines
+        //          both phases from the very first snapshot.
+        // Phase 2: pass the captured phase-1 final probe count so the
+        //          counter resumes (rather than restarts from 0%).
+        TieredEstimatorInputs tiered;
+        tiered.phase = tieredPhase_;
+        if (tieredPhase_ == 1) {
+            const bool p2AllPorts =
+                   (tieredOriginalPreset_ == ScanPreset::AllPortsFast)
+                || (tieredOriginalPreset_ == ScanPreset::AllPortsDeep);
+            tiered.phase2PortsPerHost = p2AllPorts
+                ? 65535
+                : static_cast<int>(PortsForPreset(tieredOriginalPreset_).size());
+            // Phase 2's per-offline cost depends on its ScanMode — AllPortsFast
+            // forces Fast (26-port discovery on offline); AllPortsDeep uses the
+            // user's chosen mode (Discovery / Fast / Deep). Mirror the same
+            // selection startScanInternal does for phase 2's actual run.
+            tiered.phase2ScanMode = (tieredOriginalPreset_ == ScanPreset::AllPortsFast)
+                ? static_cast<int>(ScanMode::Fast)
+                : static_cast<int>(settings_.mode);
+        } else if (tieredPhase_ == 2) {
+            tiered.phase1FinalProbes = tieredPhase1Probes_;
+        }
+        scanSession_ = std::make_unique<ScanSession>(uiHwnd, portsPerHost,
+                                                     opts.mode, tiered);
     }
     return rc;
 }
 
 int App::StartScan(const std::wstring& range, HWND uiHwnd) {
-    if (!g_scanner) return -1;
+    if (!g_scanner && !mockMode_) return -1;
 
-    // Tiered scan is intentionally disabled. The phase 1 → 2 transition
-    // produced a jarring % drop (100% → 5%) when switching from
-    // FullCommon to the full preset, and the probesTotalEstimate
-    // jumped wildly. AllPortsFast / AllPortsDeep now run the user's
-    // chosen preset directly — no early "common ports" results, but
-    // the progress bar tells the truth from the first tick.
-    tieredPhase_ = 0;
+    // v1.3.4 — tiered scan re-enabled with a stable cross-phase ETA.
+    //
+    // For AllPortsFast / AllPortsDeep, split the scan into two passes:
+    //   phase 1 = FullCommon (231 ports) on the full range — fast, gives
+    //             the user useful results within seconds
+    //   phase 2 = the user's chosen All-Ports preset on the full range —
+    //             slow, but already populated with phase-1 services
+    // The estimator projects phase-2 cost upfront so % and ETA stay
+    // continuous across the engine restart (previously this jumped 100% → 0%
+    // which is the reason this was disabled in 1.3.0–1.3.3).
+    //
+    // Non-tiered presets (Quick, Standard, FullCommon, CustomPorts) skip
+    // the split entirely — there's no "phase 2" to project.
+    if (!mockMode_
+        && (preset_ == ScanPreset::AllPortsFast
+         || preset_ == ScanPreset::AllPortsDeep)) {
+        tieredPhase_          = 1;
+        tieredOriginalPreset_ = preset_;
+        tieredRange_          = range;
+        tieredPhase1Probes_   = 0;
+    } else {
+        tieredPhase_          = 0;
+    }
     tieredPhase1Hosts_.clear();
 
     // Fresh baseline — UI thread is the only writer to these fields.
@@ -970,7 +1179,58 @@ int App::StartScan(const std::wstring& range, HWND uiHwnd) {
     selectedIp_.clear();
     userCancelled_ = false;   // drop any stale cancel flag
 
-    return startScanInternal(range, preset_, uiHwnd);
+    // --mock — populate from MockData and post the same snapshot
+    // messages the scanner thread would have posted. No engine call.
+    // Selects the first host (MikroTik router) so the right-pane
+    // is populated for the screenshot.
+    if (mockMode_) {
+        auto* snap = new (std::nothrow) EngineSnapshot{};
+        if (!snap) return -1;
+        snap->hosts                = mock::BuildHosts();
+        ScanStats ms               = mock::BuildStats();
+        snap->isRunning            = ms.isScanning;
+        snap->progressDone         = ms.progressDone;
+        snap->progressTotal        = ms.progressTotal;
+        snap->resultCount          = static_cast<int>(snap->hosts.size());
+        snap->totalScanned         = ms.totalScanned;
+        snap->onlineCount          = ms.onlineCount;
+        snap->offlineCount         = ms.offlineCount;
+        snap->durationMs           = ms.durationMs;
+        snap->probesDone           = ms.probesDone;
+        snap->probesTotalEstimate  = ms.probesTotalEstimate;
+        snap->recentHostsPerSec    = ms.recentHostsPerSec;
+        snap->recentProbesPerSec   = ms.recentProbesPerSec;
+        snap->hasRecentRate        = ms.hasRecentRate;
+        snap->statusText           = ms.statusText;
+
+        // Capture everything we need from `snap` BEFORE handing ownership to
+        // the UI thread. After PostMessageW, the UI thread may consume the
+        // snapshot (hosts std::move'd into App::hosts_) and delete it, so the
+        // pointer must not be touched again here — not even for .empty().
+        bool         hasMock = !snap->hosts.empty();
+        std::wstring firstIp = hasMock ? snap->hosts.front().ip : std::wstring();
+
+        if (!PostMessageW(uiHwnd, WM_NL_APPLY_SNAPSHOT, 0,
+                          reinterpret_cast<LPARAM>(snap))) {
+            delete snap;
+            return -1;
+        }
+        // Pre-select the first row so DetailsPanel paints. SyncUiFromEngine
+        // notices selectedIp_ and tells HostTable to focus that row.
+        if (hasMock) {
+            selectedIp_    = firstIp;
+            selectedIndex_ = 0;
+        }
+        PostMessageW(uiHwnd, WM_NL_SCAN_FINISHED, 0, 0);
+        return 0;
+    }
+
+    // Phase 1 of a tiered scan runs FullCommon; phase 2 (kicked from
+    // OnScanFinished) runs the user's chosen All-Ports preset.
+    const ScanPreset effPreset = (tieredPhase_ == 1)
+                                   ? ScanPreset::FullCommon
+                                   : preset_;
+    return startScanInternal(range, effPreset, uiHwnd);
 }
 
 void App::CancelScan() {
@@ -981,6 +1241,7 @@ void App::CancelScan() {
     userCancelled_ = true;
     tieredPhase_ = 0;
     tieredPhase1Hosts_.clear();
+    tieredPhase1Probes_ = 0;
     // Do NOT join the scanner thread here. We need it to keep polling
     // the engine and post one more snapshot once the workers finish
     // unwinding (which can take 5–10 s for AllPortsFast because each
@@ -1005,6 +1266,7 @@ void App::ClearScan() {
     selectedIp_.clear();
     tieredPhase_ = 0;
     tieredPhase1Hosts_.clear();
+    tieredPhase1Probes_ = 0;
     userCancelled_ = false;
 }
 
@@ -1014,6 +1276,19 @@ int App::ExportCsv(const std::wstring& path) {
 }
 
 int App::ExportHtml(const std::wstring& path) {
+    if (mockMode_) {
+        // --mock — dump the embedded report straight to disk. Bypasses
+        // the engine entirely, so this works even before any scan.
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        const char* bytes = mock::ExportHtmlBytes();
+        DWORD       size  = static_cast<DWORD>(mock::ExportHtmlSize());
+        DWORD       wrote = 0;
+        BOOL ok = WriteFile(h, bytes, size, &wrote, nullptr);
+        CloseHandle(h);
+        return (ok && wrote == size) ? 0 : -1;
+    }
     if (!g_scanner) return -1;
     return nl_scanner_export_html(g_scanner, WideToUtf8(path).c_str());
 }
@@ -1025,6 +1300,17 @@ int App::ExportHtml(const std::wstring& path) {
 // (WM_NL_APPLY_SNAPSHOT).
 bool App::ApplySnapshot(EngineSnapshot&& snap) {
     const size_t prevCount = hosts_.size();
+
+    // Save the previously-selected host's engineIndex BEFORE we move the
+    // new vector in. If the same engineIndex still resolves to the same
+    // host post-merge, we leave the port-detail cache intact — otherwise
+    // we'd thrash the engine with nl_scanner_get_port() calls on every
+    // 100 ms snapshot just to rebuild a cache that hasn't changed.
+    int prevSelectedEngineIdx = -1;
+    if (selectedIndex_ >= 0
+        && selectedIndex_ < static_cast<int>(hosts_.size())) {
+        prevSelectedEngineIdx = hosts_[selectedIndex_].engineIndex;
+    }
 
     // Move the bulk fields in.
     hosts_                    = std::move(snap.hosts);
@@ -1045,10 +1331,24 @@ bool App::ApplySnapshot(EngineSnapshot&& snap) {
     stats_.hasRecentRate      = snap.hasRecentRate;
     stats_.statusText         = std::move(snap.statusText);
 
-    // Invalidate the per-host port cache — engine indices are about to be
-    // re-read against a fresh snapshot.
-    portsCache_.clear();
-    portsCacheHostIdx_ = -1;
+    // Per-host port cache: keep it if the selected host's engineIndex is
+    // unchanged across the snapshot — the user's right pane keeps
+    // displaying the same port detail and we don't need to re-walk
+    // nl_scanner_get_port() (which costs N engine calls per host).
+    // Conservatively bust whenever the host list shrank or the count is
+    // tiny (fresh-scan transition) where indices commonly reshuffle.
+    bool keepPortsCache = false;
+    if (portsCacheHostIdx_ >= 0
+        && portsCacheHostIdx_ < static_cast<int>(hosts_.size())
+        && hosts_[portsCacheHostIdx_].engineIndex == prevSelectedEngineIdx
+        && prevSelectedEngineIdx >= 0
+        && hosts_.size() >= prevCount) {
+        keepPortsCache = true;
+    }
+    if (!keepPortsCache) {
+        portsCache_.clear();
+        portsCacheHostIdx_ = -1;
+    }
 
     // Tiered scan phase 2: merge phase-1 cache into the grid.
     // Phase 2 rediscovers hosts via ICMP/ARP within ~1 s but the TCP port
@@ -1141,6 +1441,7 @@ void App::OnScanFinished(HWND uiHwnd) {
         userCancelled_ = false;
         tieredPhase_   = 0;
         tieredPhase1Hosts_.clear();
+        tieredPhase1Probes_ = 0;
         return;
     }
 
@@ -1148,16 +1449,29 @@ void App::OnScanFinished(HWND uiHwnd) {
         // Snapshot phase-1 hosts so the grid stays populated while phase 2
         // re-discovers, then kick the All-Ports pass.
         tieredPhase1Hosts_ = hosts_;
+        // Freeze phase-1's final probe count BEFORE clear_results — this is
+        // the baseline the phase-2 ScanSession will add to its own probesDone
+        // so the displayed counter resumes continuously across the flip.
+        tieredPhase1Probes_ = g_scanner ? nl_scanner_probes_done(g_scanner) : 0;
         tieredPhase_       = 2;
         if (g_scanner) nl_scanner_clear_results(g_scanner);
         int rc = startScanInternal(tieredRange_, tieredOriginalPreset_, uiHwnd);
-        if (rc != 0) {
+        if (rc == 0) {
+            // The phase-1 final snapshot set stats_.isScanning=false and
+            // statusText="Done". Override to keep the pill green ("Scanning…")
+            // until phase 2's first snapshot lands, otherwise the UI flickers
+            // "Done" → "Scanning · X%" the moment the next snap arrives.
+            stats_.isScanning = true;
+            stats_.statusText = L"Scanning\x2026";   // "Scanning…"
+        } else {
             tieredPhase_ = 0;
             tieredPhase1Hosts_.clear();
+            tieredPhase1Probes_ = 0;
         }
     } else if (tieredPhase_ == 2) {
         tieredPhase_ = 0;
         tieredPhase1Hosts_.clear();
+        tieredPhase1Probes_ = 0;
     }
 }
 
@@ -1166,6 +1480,10 @@ void App::OnScanFinished(HWND uiHwnd) {
 // WM_NL_APPLY_SNAPSHOT and feeds them to ApplySnapshot() above.
 
 std::wstring App::DefaultRange() {
+    // --mock — RANGE field shows the same subnet the mock fleet lives on
+    // so the screenshot doesn't suggest "I scanned 192.168.6.x but the
+    // results say 192.168.1.x".
+    if (mockMode_) return L"192.168.1.1-192.168.1.254";
     int count = nl_adapters_count();
     for (int i = 0; i < count; ++i) {
         nl_adapter_t a{};
@@ -1199,6 +1517,34 @@ void App::RebuildFilter() {
         if (filter_ == HostFilter::OnlineOnly && !h.isOnline) continue;
         if (filter_ == HostFilter::HasOpenPorts && h.openPorts.empty()) continue;
 
+        // v1.3.3 — severity filter (orthogonal to the HostFilter
+        // above). Find the worst finding on this host and gate on it.
+        // FindingSeverity enum is ordered Critical=0, High=1,
+        // Medium=2, Low=3; lower value == worse, hence the `<=`
+        // direction in the gate.
+        if (minSeverity_ != SeverityFilter::None) {
+            // Map the SeverityFilter to the FindingSeverity threshold
+            // it admits. e.g. HighPlus admits Critical OR High.
+            int gateRank;
+            switch (minSeverity_) {
+                case SeverityFilter::CriticalOnly:
+                    gateRank = static_cast<int>(FindingSeverity::Critical); break;
+                case SeverityFilter::HighPlus:
+                    gateRank = static_cast<int>(FindingSeverity::High);     break;
+                case SeverityFilter::MediumPlus:
+                    gateRank = static_cast<int>(FindingSeverity::Medium);   break;
+                default:
+                    gateRank = static_cast<int>(FindingSeverity::Low);      break;
+            }
+            int worstRank = static_cast<int>(FindingSeverity::Low) + 1;  // sentinel
+            for (const auto& f : h.findings) {
+                int r = static_cast<int>(f.severity);
+                if (r < worstRank) worstRank = r;
+                if (worstRank == 0) break;   // already at Critical
+            }
+            if (worstRank > gateRank) continue;
+        }
+
         if (!needle.empty()) {
             if (!ContainsIgnoreCase(h.ip,         needle) &&
                 !ContainsIgnoreCase(h.hostname,   needle) &&
@@ -1228,8 +1574,15 @@ void App::RebuildFilter() {
             case SortColumn::Hostname:      return strcmp_(A.hostname,   B.hostname);
             case SortColumn::Vendor:        return strcmp_(A.vendor,     B.vendor);
             case SortColumn::Device:        return strcmp_(A.deviceType, B.deviceType);
+            case SortColumn::Model:         return strcmp_(A.deviceModel, B.deviceModel);
             case SortColumn::OpenPortCount:
-                if (A.portCount != B.portCount) return A.portCount - B.portCount; return 0;
+                // Sort by number of open ports per host. (`firstOpenPort`
+                // is kept on HostRow for other uses — sort uses portCount
+                // because the column actually labels "Open TCP ports" and
+                // the user's mental model is "which boxes are doing the
+                // most", not "which boxes have the lowest port number".)
+                if (A.portCount != B.portCount) return A.portCount - B.portCount;
+                return 0;
             case SortColumn::Services:
                 if (A.serviceCount != B.serviceCount) return A.serviceCount - B.serviceCount;
                 return 0;
@@ -1281,10 +1634,15 @@ const std::vector<PortRow>& App::PortsForHost(int hostIndex) {
     }
     portsCache_.clear();
     portsCacheHostIdx_ = hostIndex;
-    if (!g_scanner || hostIndex < 0
-        || hostIndex >= static_cast<int>(hosts_.size())) {
+    if (hostIndex < 0 || hostIndex >= static_cast<int>(hosts_.size())) {
         return portsCache_;
     }
+    // --mock — HostRow.ports is pre-populated by MockData.cpp.
+    if (mockMode_) {
+        portsCache_ = hosts_[hostIndex].ports;
+        return portsCache_;
+    }
+    if (!g_scanner) return portsCache_;
     int engineIdx = hosts_[hostIndex].engineIndex;
     if (engineIdx < 0) return portsCache_;
 

@@ -82,17 +82,30 @@ std::wstring DnsResolver::reverseLookup(uint32_t hostOrderIp, int timeoutMs) {
     auto promise = std::make_shared<std::promise<std::wstring>>();
     auto future  = promise->get_future();
 
-    std::thread([promise, hostOrderIp]() {
-        try {
-            promise->set_value(blockingLookup(hostOrderIp));
-        } catch (...) {
-            try { promise->set_value(std::wstring{}); }
-            catch (...) { /* future already satisfied — ignore */ }
-        }
-        // Free the slot only after the OS call returns (or throws) so we
-        // never undercount and let the pool over-commit.
+    // v1.3.5 — std::thread construction can throw std::system_error under
+    // thread / memory exhaustion. We already fetch_add'd above; if the
+    // thread never starts, the matching fetch_sub in the lambda never runs
+    // and the in-flight counter drifts up by 1 — over time this would
+    // permanently block reverse-DNS by exhausting the slot pool. Wrap the
+    // construction in try/catch and roll the counter back on failure.
+    try {
+        std::thread([promise, hostOrderIp]() {
+            try {
+                promise->set_value(blockingLookup(hostOrderIp));
+            } catch (...) {
+                try { promise->set_value(std::wstring{}); }
+                catch (...) { /* future already satisfied — ignore */ }
+            }
+            // Free the slot only after the OS call returns (or throws) so we
+            // never undercount and let the pool over-commit.
+            g_inFlightLookups.fetch_sub(1, std::memory_order_acq_rel);
+        }).detach();
+    } catch (...) {
+        // OS refused to start a new thread. Roll back the slot reservation
+        // and report "no hostname" — caller already handles empty results.
         g_inFlightLookups.fetch_sub(1, std::memory_order_acq_rel);
-    }).detach();
+        return L"";
+    }
 
     auto status = future.wait_for(std::chrono::milliseconds(timeoutMs));
     if (status == std::future_status::ready) {
