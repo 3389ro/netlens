@@ -226,6 +226,10 @@ private:
     std::wstring          tieredRange_;
     std::vector<HostRow>  tieredPhase1Hosts_;
     int64_t               tieredPhase1Probes_    = 0;
+    // Frozen phase-1 elapsed ms, added as a baseline during phase 2 so the
+    // DURATION card keeps counting up across the engine flip instead of
+    // resetting to 0 (mirrors tieredPhase1Probes_ for the probe counter).
+    int64_t               tieredPhase1DurationMs_ = 0;
 
     // Cancel-vs-finish race: if the user clicks Cancel while a
     // WM_NL_SCAN_FINISHED is already queued by the worker, the dispatcher

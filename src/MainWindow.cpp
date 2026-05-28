@@ -1095,6 +1095,10 @@ void CreateChildControls(State& s, HINSTANCE hInst) {
         0, 0, 0, 0,
         s.hwnd, reinterpret_cast<HMENU>(IDC_CUSTOM_PORTS_EDIT), hInst, nullptr);
     setFont(s.customPortsEdit);
+    // Grey placeholder so the expected format is obvious the moment the box
+    // appears: a comma-separated list of individual ports and/or a-b ranges.
+    SendMessageW(s.customPortsEdit, EM_SETCUEBANNER, TRUE,
+                 reinterpret_cast<LPARAM>(L"e.g. 22,80,443,8000-8100"));
 
     s.startBtn = CreateWindowExW(0, L"BUTTON", L"Start scan",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | BS_OWNERDRAW | BS_DEFPUSHBUTTON,
@@ -1213,6 +1217,7 @@ void CreateChildControls(State& s, HINSTANCE hInst) {
         RegisterTooltip(s.hTooltip, s.adapterBtn,    L"Pick network adapter \x2192 fill range");
         RegisterTooltip(s.hTooltip, s.rangeEdit,     L"IPv4 range to scan. Examples: 192.168.1.0/24, 10.0.0.1-10.0.0.50");
         RegisterTooltip(s.hTooltip, s.searchEdit,    L"Filter the host table by IP, hostname, vendor, ports or service  (Ctrl+F)");
+        RegisterTooltip(s.hTooltip, s.customPortsEdit, L"Custom ports to scan \x2014 comma-separated list and/or a-b ranges. Example: 22,80,443,3389,8000-8100");
     }
 
     // Initial focus
@@ -1982,8 +1987,15 @@ void OnPresetChanged(State& s) {
     if (sel < 0) sel = 0;
     ScanPreset p = static_cast<ScanPreset>(sel);
     App::Instance().SetCurrentPreset(p);
-    ShowWindow(s.customPortsEdit,
-               p == ScanPreset::CustomPorts ? SW_SHOW : SW_HIDE);
+    const bool isCustom = (p == ScanPreset::CustomPorts);
+    ShowWindow(s.customPortsEdit, isCustom ? SW_SHOW : SW_HIDE);
+    // Re-run the toolbar layout NOW. DoLayout parks the custom-ports box
+    // off-screen (x = -wCustom) for non-Custom presets and only repositions it
+    // on a layout pass; without this call, selecting "Custom Ports" would
+    // SW_SHOW the box at its stale off-screen X — so it looked missing until
+    // the next window resize. Then drop the caret into it for immediate typing.
+    DoLayout(s);
+    if (isCustom) SetFocus(s.customPortsEdit);
 }
 
 // ---------------------------------------------------------------------------

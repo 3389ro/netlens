@@ -235,6 +235,37 @@ std::wstring PresetToPortsCsv(ScanPreset p, const std::wstring& customCsv) {
     return L"";
 }
 
+// Tiered phase 2 port spec: "1-65535 minus the FullCommon set". Phase 1 already
+// deep-checked every FullCommon port, so phase 2 only needs the long tail — that
+// makes it purely additive (it never re-scans, or momentarily re-reports as
+// fewer, the ports discovery already found). Returned as a compact range list
+// (e.g. "1-19,21,23-24,..."). Computed once and cached.
+std::wstring AllPortsExceptFullCommonCsv() {
+    static const std::wstring cached = [] {
+        std::vector<bool> skip(65537, false);
+        for (size_t i = 0; i < std::size(kFullCommonPorts); ++i) {
+            unsigned p = kFullCommonPorts[i];
+            if (p >= 1 && p <= 65535) skip[p] = true;
+        }
+        std::wstring out;
+        int runStart = -1;
+        for (int p = 1; p <= 65536; ++p) {            // p == 65536 flushes the last run
+            bool inc = (p <= 65535) && !skip[p];
+            if (inc) {
+                if (runStart < 0) runStart = p;
+            } else if (runStart >= 0) {
+                int runEnd = p - 1;
+                if (!out.empty()) out += L',';
+                out += std::to_wstring(runStart);
+                if (runEnd != runStart) { out += L'-'; out += std::to_wstring(runEnd); }
+                runStart = -1;
+            }
+        }
+        return out;
+    }();
+    return cached;
+}
+
 // Canonical port → service description. Used by the Port Lists dialog
 // only; the engine has its own internal service detection and is not
 // driven by this table.
@@ -504,6 +535,7 @@ const std::unordered_map<uint16_t, const wchar_t*>& PortServiceMap() {
 struct TieredEstimatorInputs {
     int     phase                = 0;   // 0 = non-tiered, 1 = phase 1 running, 2 = phase 2 running
     int64_t phase1FinalProbes    = 0;   // valid when phase == 2: actual final probesDone from phase 1
+    int64_t phase1FinalDurationMs = 0;  // valid when phase == 2: phase-1 elapsed ms, added so DURATION continues
     int     phase2PortsPerHost   = 0;   // valid when phase == 1: per-online cost of the upcoming phase 2
     int     phase2ScanMode       = 0;   // valid when phase == 1: ScanMode int of the upcoming phase 2
 };
@@ -797,6 +829,12 @@ private:
             snap->probesDone          += tiered_.phase1FinalProbes;
             snap->probesTotalEstimate += tiered_.phase1FinalProbes;
         }
+        // Duration is per-engine-session, so phase 2's fresh session restarts it
+        // at 0. Add phase 1's elapsed time so the DURATION card keeps counting
+        // up across the flip instead of resetting.
+        if (tiered_.phase == 2 && tiered_.phase1FinalDurationMs > 0) {
+            snap->durationMs += tiered_.phase1FinalDurationMs;
+        }
 
         // ---- statusText (pill + status bar) ----
         if (isRunning) {
@@ -1024,6 +1062,13 @@ int App::startScanInternal(const std::wstring& range, ScanPreset effPreset, HWND
 
     std::string  rangeU8     = WideToUtf8(range);
     std::wstring portsCsvW   = PresetToPortsCsv(effPreset, customPortsCsv_);
+    // Tiered phase 2 skips the FullCommon ports phase 1 already deep-checked:
+    // the sweep is the long tail only, so it's purely additive (no re-scan of
+    // discovery's ports). Phase-1 results are merged back in ApplySnapshot.
+    if (tieredPhase_ == 2
+        && (preset_ == ScanPreset::AllPortsFast || preset_ == ScanPreset::AllPortsDeep)) {
+        portsCsvW = AllPortsExceptFullCommonCsv();
+    }
     std::string  portsCsvU8  = WideToUtf8(portsCsvW);
 
     // Auto-disable DNS reverse lookups for big scans. getnameinfo has
@@ -1135,7 +1180,8 @@ int App::startScanInternal(const std::wstring& range, ScanPreset effPreset, HWND
                 ? static_cast<int>(ScanMode::Fast)
                 : static_cast<int>(settings_.mode);
         } else if (tieredPhase_ == 2) {
-            tiered.phase1FinalProbes = tieredPhase1Probes_;
+            tiered.phase1FinalProbes     = tieredPhase1Probes_;
+            tiered.phase1FinalDurationMs = tieredPhase1DurationMs_;
         }
         scanSession_ = std::make_unique<ScanSession>(uiHwnd, portsPerHost,
                                                      opts.mode, tiered);
@@ -1166,6 +1212,7 @@ int App::StartScan(const std::wstring& range, HWND uiHwnd) {
         tieredOriginalPreset_ = preset_;
         tieredRange_          = range;
         tieredPhase1Probes_   = 0;
+        tieredPhase1DurationMs_ = 0;
     } else {
         tieredPhase_          = 0;
     }
@@ -1363,14 +1410,53 @@ bool App::ApplySnapshot(EngineSnapshot&& snap) {
         p1Map.reserve(tieredPhase1Hosts_.size() * 2);
         for (const auto& h1 : tieredPhase1Hosts_) p1Map[h1.ip] = &h1;
 
+        // Union of two "a, b, c" port CSVs, numerically sorted + de-duped. Phase
+        // 2 only ever ADDS ports, so unioning with phase 1 means the grid never
+        // shows fewer ports than the initial discovery already found.
+        auto unionPortsCsv = [](const std::wstring& a, const std::wstring& b) -> std::wstring {
+            std::vector<int> v;
+            auto add = [&v](const std::wstring& csv) {
+                size_t i = 0;
+                while (i < csv.size()) {
+                    while (i < csv.size() && (csv[i] < L'0' || csv[i] > L'9')) ++i;
+                    size_t j = i;
+                    while (j < csv.size() && csv[j] >= L'0' && csv[j] <= L'9') ++j;
+                    if (j > i && j - i <= 6) v.push_back(std::stoi(csv.substr(i, j - i)));
+                    i = (j > i) ? j : i + 1;
+                }
+            };
+            add(a); add(b);
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+            std::wstring out;
+            for (int p : v) { if (!out.empty()) out += L", "; out += std::to_wstring(p); }
+            return out;
+        };
+        auto tokenCount = [](const std::wstring& csv) -> int {
+            if (csv.empty()) return 0;
+            return 1 + static_cast<int>(std::count(csv.begin(), csv.end(), L','));
+        };
+
         for (auto& h : hosts_) {
             auto it = p1Map.find(h.ip);
             if (it == p1Map.end()) continue;
             const HostRow& h1 = *it->second;
-            if (h.openPorts.empty()   && !h1.openPorts.empty())   h.openPorts   = h1.openPorts;
-            if (h.services.empty()    && !h1.services.empty())    h.services    = h1.services;
-            if (h.portCount == 0      && h1.portCount > 0)        h.portCount   = h1.portCount;
-            if (h.serviceCount == 0   && h1.serviceCount > 0)     h.serviceCount = h1.serviceCount;
+            // Open ports: superset, so phase 2's incremental re-sweep never makes
+            // the host's port list shrink below what phase 1 reported.
+            if (!h1.openPorts.empty()) {
+                std::wstring u = unionPortsCsv(h.openPorts, h1.openPorts);
+                if (!u.empty()) {
+                    h.openPorts = u;
+                    int cnt = tokenCount(u);
+                    if (cnt > h.portCount) h.portCount = cnt;
+                }
+            }
+            // Service summary: keep whichever lists more — phase 1's fingerprints
+            // are richer until phase 2 re-scans the same ports.
+            if (tokenCount(h1.services) > tokenCount(h.services)) h.services = h1.services;
+            if (h1.serviceCount > h.serviceCount) h.serviceCount = h1.serviceCount;
+            // Enrichment phase 2 only re-derives after scanning the relevant port:
+            // keep phase 1's value until phase 2 produces a (non-empty) one.
             if (h.hostname.empty()    && !h1.hostname.empty())    h.hostname    = h1.hostname;
             if (h.deviceType.empty()  && !h1.deviceType.empty())  h.deviceType  = h1.deviceType;
             if (h.deviceModel.empty() && !h1.deviceModel.empty()) h.deviceModel = h1.deviceModel;
@@ -1379,7 +1465,24 @@ bool App::ApplySnapshot(EngineSnapshot&& snap) {
             if (h.deviceHint.empty()  && !h1.deviceHint.empty())  h.deviceHint  = h1.deviceHint;
             if (h.webUiModel.empty()  && !h1.webUiModel.empty())  h.webUiModel  = h1.webUiModel;
             if (h.udpDiscovery.empty()&& !h1.udpDiscovery.empty()) h.udpDiscovery = h1.udpDiscovery;
+            if (h.smbShares.empty()   && !h1.smbShares.empty())   h.smbShares   = h1.smbShares;
             if (h.badges.empty()      && !h1.badges.empty())      h.badges      = h1.badges;
+            // Printer SNMP / IoT / findings / risk / clock: phase 2 re-derives
+            // these only after it re-scans the relevant port (Printer-MIB walk,
+            // fingerprint, clock probe). Keep phase 1's data until phase 2
+            // produces its own, and never let the richer phase-1 result regress
+            // (this is why printer consumables vanished when phase 2 started).
+            if (!h.isPrinter                && h1.isPrinter)                    h.isPrinter         = true;
+            if (h.printerVendor.empty()     && !h1.printerVendor.empty())      h.printerVendor     = h1.printerVendor;
+            if (h.printerModel.empty()      && !h1.printerModel.empty())       h.printerModel      = h1.printerModel;
+            if (h.printerSerial.empty()     && !h1.printerSerial.empty())      h.printerSerial     = h1.printerSerial;
+            if (h.printerSnmpStatus.empty() && !h1.printerSnmpStatus.empty())  h.printerSnmpStatus = h1.printerSnmpStatus;
+            if (h.printerSupplies.empty()   && !h1.printerSupplies.empty())    h.printerSupplies   = h1.printerSupplies;
+            if (h.printerPages.empty()      && !h1.printerPages.empty())       h.printerPages      = h1.printerPages;
+            if (h.iotFingerprint.empty()    && !h1.iotFingerprint.empty())     h.iotFingerprint    = h1.iotFingerprint;
+            if (h1.findings.size() > h.findings.size())                        h.findings          = h1.findings;
+            if (h1.risk > h.risk)                                              h.risk              = h1.risk;
+            if (!h.clockResponded && h1.clockResponded) { h.clockResponded = true; h.clockOffsetMs = h1.clockOffsetMs; }
             p1Map.erase(it);
         }
         for (const auto& kv : p1Map) {
@@ -1453,6 +1556,35 @@ void App::OnScanFinished(HWND uiHwnd) {
         // the baseline the phase-2 ScanSession will add to its own probesDone
         // so the displayed counter resumes continuously across the flip.
         tieredPhase1Probes_ = g_scanner ? nl_scanner_probes_done(g_scanner) : 0;
+        tieredPhase1DurationMs_ = stats_.durationMs;   // freeze elapsed so phase 2's DURATION continues, not resets
+        // Capture phase-1 per-port detail (product / version / service) BEFORE
+        // clear_results() wipes the engine — otherwise the details-pane port
+        // table loses the rich phase-1 data while phase 2 re-sweeps from port 1.
+        if (g_scanner) {
+            for (auto& h1 : tieredPhase1Hosts_) {
+                if (h1.engineIndex < 0) continue;
+                int n = nl_scanner_port_count(g_scanner, h1.engineIndex);
+                h1.ports.clear();
+                if (n > 0) h1.ports.reserve(static_cast<size_t>(n));
+                for (int i = 0; i < n; ++i) {
+                    nl_port_t p{};
+                    if (nl_scanner_get_port(g_scanner, h1.engineIndex, i, &p) != 0) continue;
+                    if (!p.is_open) continue;
+                    PortRow row;
+                    row.port        = p.port;
+                    row.isOpen      = (p.is_open != 0);
+                    row.service     = Utf8ToWide(p.service);
+                    row.protocol    = Utf8ToWide(p.protocol);
+                    row.product     = Utf8ToWide(p.product);
+                    row.version     = Utf8ToWide(p.version);
+                    row.versionNote = Utf8ToWide(p.version_note);
+                    row.detail      = Utf8ToWide(p.detail);
+                    row.ownerPid    = p.owner_pid;
+                    row.ownerExe    = Utf8ToWide(p.owner_exe);
+                    h1.ports.push_back(std::move(row));
+                }
+            }
+        }
         tieredPhase_       = 2;
         if (g_scanner) nl_scanner_clear_results(g_scanner);
         int rc = startScanInternal(tieredRange_, tieredOriginalPreset_, uiHwnd);
@@ -1644,7 +1776,12 @@ const std::vector<PortRow>& App::PortsForHost(int hostIndex) {
     }
     if (!g_scanner) return portsCache_;
     int engineIdx = hosts_[hostIndex].engineIndex;
-    if (engineIdx < 0) return portsCache_;
+    if (engineIdx < 0) {
+        // Phase-1-only host (appended during a tiered scan, not yet re-found by
+        // phase 2). Its HostRow.ports carries the cached phase-1 port detail.
+        portsCache_ = hosts_[hostIndex].ports;
+        return portsCache_;
+    }
 
     int n = nl_scanner_port_count(g_scanner, engineIdx);
     portsCache_.reserve(static_cast<size_t>(n));
@@ -1664,6 +1801,25 @@ const std::vector<PortRow>& App::PortsForHost(int hostIndex) {
         row.ownerPid    = p.owner_pid;
         row.ownerExe    = Utf8ToWide(p.owner_exe);
         portsCache_.push_back(std::move(row));
+    }
+    // Tiered scan phase 2: the engine is mid-sweep, so its live port list for
+    // this host is a growing subset. Union the cached phase-1 detail so the
+    // table doesn't regress; phase 2's rows already present take precedence.
+    if (tieredPhase_ == 2 && !tieredPhase1Hosts_.empty()) {
+        const std::wstring& ip = hosts_[hostIndex].ip;
+        for (const auto& h1 : tieredPhase1Hosts_) {
+            if (h1.ip != ip) continue;
+            for (const auto& p1 : h1.ports) {
+                bool present = false;
+                for (const auto& pc : portsCache_) {
+                    if (pc.port == p1.port) { present = true; break; }
+                }
+                if (!present) portsCache_.push_back(p1);
+            }
+            break;
+        }
+        std::sort(portsCache_.begin(), portsCache_.end(),
+                  [](const PortRow& a, const PortRow& b) { return a.port < b.port; });
     }
     return portsCache_;
 }

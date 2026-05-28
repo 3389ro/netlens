@@ -4,6 +4,13 @@ All notable changes to the project, version by version. Each entry maps to
 the matching tag and `release/<version>/NetLens.exe` binary on the
 [Releases page](https://github.com/3389ro/netlens/releases).
 
+## [1.5.14] — 2026-05-28
+
+### Fixed
+
+- Deep / All-Ports scans no longer appear to restart: the full sweep builds on the initial discovery (open ports, services, SMB shares, printer supplies and security findings are preserved), the scan duration no longer resets, and the sweep skips the ports discovery already covered.
+- Custom Ports: the port-entry box now appears immediately when the preset is selected, with an inline format hint (e.g. `22,80,443,8000-8100`).
+
 ## [1.5.13] — 2026-05-28
 
 **Theme: deeper device fingerprinting, security findings, and large-scan stability.**

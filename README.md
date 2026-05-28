@@ -5,7 +5,7 @@ Native Windows · C++20 · Single `.exe` · No installer · No telemetry · No c
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.txt)
 [![Platform: Windows 7 → 11 x64](https://img.shields.io/badge/Platform-Windows%207%20%E2%86%92%2011%20x64-0078D6)](https://3389.ro/tools/netlens)
-[![Latest: 1.5.13](https://img.shields.io/badge/Latest-1.5.13-B4E04A)](https://github.com/3389ro/netlens/releases/latest)
+[![Latest: 1.5.14](https://img.shields.io/badge/Latest-1.5.14-B4E04A)](https://github.com/3389ro/netlens/releases/latest)
 
 Maintained by [3389 Software Outsourcing](https://3389.ro). Open source under
 the MIT License — see [`LICENSE.txt`](LICENSE.txt) for terms and
@@ -106,7 +106,7 @@ NetLens/
 ├── NOTICE.txt
 ├── README.md
 ├── SECURITY.md
-├── VERSION                          ← single source of truth (1.5.13)
+├── VERSION                          ← single source of truth (1.5.14)
 ├── app.manifest
 ├── app.rc
 ├── build.ps1                        ← one-shot Configure + Build
